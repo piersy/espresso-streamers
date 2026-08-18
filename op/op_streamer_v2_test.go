@@ -45,6 +45,7 @@ func newTestStreamer(t *testing.T, namespace uint64, batcher common.Address, ori
 		derivation.CreateEspressoBatchUnmarshaler(),
 		func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil },
 		time.Second,
+		50*time.Millisecond,
 		new(NoOpLogger),
 		0,
 		originBatchPos,
@@ -95,7 +96,7 @@ func TestNewStreamerValidation(t *testing.T) {
 		p func(context.Context) (*eth.SyncStatus, error), interval time.Duration) error {
 		_, err := NewStreamer(
 			context.Background(), state, state, l2, lc, authAddr, 1,
-			derivation.CreateEspressoBatchUnmarshaler(), p, interval, new(NoOpLogger), 0, 1,
+			derivation.CreateEspressoBatchUnmarshaler(), p, interval, time.Second, new(NoOpLogger), 0, 1,
 		)
 		return err
 	}
@@ -620,7 +621,8 @@ func TestFetchStoresAndServesSignedBatch(t *testing.T) {
 
 	// One poll iteration, driven directly so the test does not race a ticker.
 	streamer.pollForFinality(ctx)
-	require.NoError(t, streamer.fetchEspressoTransactions(ctx))
+	_, err = streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
 
 	got := streamer.Peek(ctx)
 	require.NotNil(t, got, "the signed batch should have been stored and accepted")
@@ -651,7 +653,8 @@ func TestFetchDropsForeignSignedBatch(t *testing.T) {
 	state.AddEspressoTransactionData(0, namespace, createTransactionsInBlock(txn))
 
 	streamer.pollForFinality(ctx)
-	require.NoError(t, streamer.fetchEspressoTransactions(ctx))
+	_, err = streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
 
 	require.Nil(t, streamer.Peek(ctx), "a batch signed by an unauthorized key must be dropped")
 	require.Zero(t, storeTotal(streamer), "it must not even be stored")
@@ -663,7 +666,8 @@ func TestFetchRejectsOverflowingEspressoHeight(t *testing.T) {
 	state, streamer := newTestStreamer(t, 42, common.Address{}, 1)
 	state.LatestEspHeight = math.MaxUint64
 
-	require.ErrorContains(t, streamer.fetchEspressoTransactions(context.Background()), "overflows uint64")
+	_, err := streamer.fetchEspressoTransactions(context.Background())
+	require.ErrorContains(t, err, "overflows uint64")
 	require.Zero(t, streamer.hotShotPos, "the position must not move on a rejected height")
 }
 
@@ -675,8 +679,32 @@ func TestFetchNoOpWhenCaughtUp(t *testing.T) {
 	require.NoError(t, err)
 
 	streamer.hotShotPos = latest
-	require.NoError(t, streamer.fetchEspressoTransactions(ctx))
+	caughtUp, err := streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
+	require.True(t, caughtUp, "the caught-up path must report itself so the poll loop can pace")
 	require.Equal(t, latest, streamer.hotShotPos, "position must not move when already caught up")
+}
+
+// TestPollHotShotIdlesWhenCaughtUp pins the fix for #39: once caught up, pollHotShot
+// must pace its height polls instead of retrying in a tight loop.
+func TestPollHotShotIdlesWhenCaughtUp(t *testing.T) {
+	state, streamer := newTestStreamer(t, 42, common.Address{}, 1)
+
+	latest, err := streamer.espressoClient.FetchLatestBlockHeight(context.Background())
+	require.NoError(t, err)
+	streamer.hotShotPos = latest // caught up: nothing to fetch for the whole window
+
+	before := state.LatestHeightCalls.Load()
+	require.NoError(t, streamer.Start(context.Background()))
+	time.Sleep(200 * time.Millisecond)
+	streamer.Stop()
+
+	calls := state.LatestHeightCalls.Load() - before
+	// A paced loop polls the height a handful of times in 200ms at worst; the unpaced
+	// spin reaches tens of thousands. The bound is deliberately generous so the test
+	// pins "no spin" rather than any particular idle interval.
+	require.LessOrEqual(t, calls, int64(10),
+		"pollHotShot spun on FetchLatestBlockHeight while caught up: %d calls in 200ms", calls)
 }
 
 // TestPollForFinalityTakesTheFurtherAheadL1View covers reading L1 finality straight from
@@ -762,7 +790,7 @@ func TestFallbackHotshotPosStartsAtStreamerOrigin(t *testing.T) {
 		context.Background(), state, state, state, state, batchAuthenticatorAddr, 42,
 		derivation.CreateEspressoBatchUnmarshaler(),
 		func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil },
-		time.Second, new(NoOpLogger), originHotShotPos, 1,
+		time.Second, time.Second, new(NoOpLogger), originHotShotPos, 1,
 	)
 	require.NoError(t, err)
 
@@ -826,7 +854,7 @@ func newPollCountingStreamer(t *testing.T) (*MockStreamerSource, *Streamer, *ato
 
 	streamer, err := NewStreamer(
 		context.Background(), state, state, state, state, batchAuthenticatorAddr, 1,
-		derivation.CreateEspressoBatchUnmarshaler(), poller, time.Millisecond, new(NoOpLogger), 0, 1,
+		derivation.CreateEspressoBatchUnmarshaler(), poller, time.Millisecond, time.Millisecond, new(NoOpLogger), 0, 1,
 	)
 	require.NoError(t, err)
 
@@ -869,7 +897,7 @@ func TestStreamerPrimesFinalityBeforeStart(t *testing.T) {
 		context.Background(), state, state, state, state, batchAuthenticatorAddr, 1,
 		derivation.CreateEspressoBatchUnmarshaler(),
 		func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil },
-		time.Millisecond, new(NoOpLogger), 0, 1,
+		time.Millisecond, time.Millisecond, new(NoOpLogger), 0, 1,
 	)
 	require.NoError(t, err)
 	require.Zero(t, streamer.finalizedL1.Number, "finality is unknown until a poll happens")

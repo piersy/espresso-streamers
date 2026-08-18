@@ -54,9 +54,13 @@ type Streamer struct {
 
 	mu sync.RWMutex
 
-	// How long the HotShot loop waits before retrying after a failed fetch. It does
-	// not pace that loop otherwise: with work available it runs hot.
+	// How long the HotShot loop waits before retrying after a failed fetch. With a
+	// backlog available the loop runs hot.
 	retryTime time.Duration
+
+	// How long the HotShot loop waits before polling again once it has caught up with
+	// the chain.
+	idlePollInterval time.Duration
 
 	// How often the finality loop refreshes its view of L1/L2 finality.
 	finalityInterval time.Duration
@@ -84,6 +88,7 @@ func NewStreamer(
 	unmarshal func([]byte, uint64) (*derivation.EspressoBatch, error),
 	pollerFunc func(context.Context) (*eth.SyncStatus, error),
 	retryTime time.Duration,
+	idlePollInterval time.Duration,
 	logger log.Logger,
 	originHotShotPos uint64,
 	originBatchPos uint64,
@@ -102,6 +107,9 @@ func NewStreamer(
 	}
 	if retryTime <= 0 {
 		return nil, fmt.Errorf("retryTime must be positive, got %s", retryTime)
+	}
+	if idlePollInterval <= 0 {
+		return nil, fmt.Errorf("idlePollInterval must be positive, got %s", idlePollInterval)
 	}
 
 	originBatchHash, err := l2Client.HeaderHashByNumber(ctx, new(big.Int).SetUint64(originBatchPos))
@@ -125,6 +133,7 @@ func NewStreamer(
 		pollerFunc:                pollerFunc,
 		logger:                    logger,
 		retryTime:                 retryTime,
+		idlePollInterval:          idlePollInterval,
 		finalityInterval:          defaultFinalityInterval,
 		store:                     newBatchStore(originBatchPos+1, originBatchHash, logger),
 		hotShotPos:                originHotShotPos,
@@ -281,10 +290,19 @@ func (s *Streamer) pollHotShot(ctx context.Context) {
 
 	for ctx.Err() == nil {
 		fetchCtx, cancelFetch := context.WithTimeout(ctx, pollRPCTimeout)
-		err := s.fetchEspressoTransactions(fetchCtx)
+		caughtUp, err := s.fetchEspressoTransactions(fetchCtx)
 		cancelFetch()
 
 		if err == nil {
+			if !caughtUp {
+				continue
+			}
+			// Pace the height polls if we are caught up.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(s.idlePollInterval):
+			}
 			continue
 		}
 		select {
@@ -410,17 +428,20 @@ func (s *Streamer) confirmEspressoBlockHeight(ctx context.Context, finalizedL1Or
 	}
 }
 
-func (s *Streamer) fetchEspressoTransactions(ctx context.Context) error {
+// fetchEspressoTransactions pulls the next range of HotShot blocks and feeds the store.
+// It reports caughtUp=true when there was nothing to fetch, so the caller can pace its
+// polling instead of spinning (#39).
+func (s *Streamer) fetchEspressoTransactions(ctx context.Context) (caughtUp bool, err error) {
 	finalizedBlockHeight, err := s.espressoClient.FetchLatestBlockHeight(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// The exclusive end of the fetch range is this height plus one, which would wrap.
 	if finalizedBlockHeight == math.MaxUint64 {
-		return fmt.Errorf("espresso block height overflows uint64")
+		return false, fmt.Errorf("espresso block height overflows uint64")
 	}
 	if s.hotShotPos >= finalizedBlockHeight {
-		return nil
+		return true, nil
 	}
 
 	end := s.hotShotPos + HOTSHOT_BLOCK_FETCH_LIMIT
@@ -432,7 +453,7 @@ func (s *Streamer) fetchEspressoTransactions(ctx context.Context) error {
 
 	blocks, err := s.espressoClient.FetchNamespaceTransactionsInRange(ctx, s.hotShotPos, end, s.namespace)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	s.logger.Info("fetched HotShot range", "start", s.hotShotPos, "end", end, "blocks", len(blocks))
@@ -440,7 +461,7 @@ func (s *Streamer) fetchEspressoTransactions(ctx context.Context) error {
 	// hotShotPos advances to end below and never rewinds, so a short response would
 	// skip the blocks it left out for good.
 	if uint64(len(blocks)) != end-s.hotShotPos {
-		return fmt.Errorf("hotshot range [%d, %d): got %d blocks, want %d",
+		return false, fmt.Errorf("hotshot range [%d, %d): got %d blocks, want %d",
 			s.hotShotPos, end, len(blocks), end-s.hotShotPos)
 	}
 
@@ -448,19 +469,19 @@ func (s *Streamer) fetchEspressoTransactions(ctx context.Context) error {
 	// the finalized L1 block of the HotShot block that carried it (see checkBatch).
 	headers, err := s.espressoClient.FetchHeadersByRange(ctx, s.hotShotPos, end)
 	if err != nil {
-		return fmt.Errorf("failed to fetch hotshot headers for range [%d, %d): %w", s.hotShotPos, end, err)
+		return false, fmt.Errorf("failed to fetch hotshot headers for range [%d, %d): %w", s.hotShotPos, end, err)
 	}
 
 	// Batches are positionally associated with headers, so bail rather than risk
 	// authorizing a batch against another block's anchor.
 	if len(headers) != len(blocks) {
-		return fmt.Errorf("hotshot header/transaction count mismatch for range [%d, %d): %d headers vs %d blocks",
+		return false, fmt.Errorf("hotshot header/transaction count mismatch for range [%d, %d): %d headers vs %d blocks",
 			s.hotShotPos, end, len(headers), len(blocks))
 	}
 	// Validate the whole range before processing any of it.
 	for i := range headers {
 		if got, want := headers[i].Header.GetBlockHeight(), s.hotShotPos+uint64(i); got != want {
-			return fmt.Errorf("hotshot headers not contiguous/ordered for range [%d, %d): header index %d has height %d, expected %d",
+			return false, fmt.Errorf("hotshot headers not contiguous/ordered for range [%d, %d): header index %d has height %d, expected %d",
 				s.hotShotPos, end, i, got, want)
 		}
 		// Batches are authorized against this L1 finalized header, so one without it is
@@ -468,7 +489,7 @@ func (s *Streamer) fetchEspressoTransactions(ctx context.Context) error {
 		// (impossible on a live chain)
 		// https://github.com/EspressoSystems/espresso-network/blob/main/crates/espresso/types/src/v0/v0_1/l1.rs#L64-L72
 		if headers[i].Header.GetL1Finalized() == nil {
-			return fmt.Errorf("hotshot header at height %d reports no finalized L1 block",
+			return false, fmt.Errorf("hotshot header at height %d reports no finalized L1 block",
 				s.hotShotPos+uint64(i))
 		}
 	}
@@ -484,7 +505,7 @@ func (s *Streamer) fetchEspressoTransactions(ctx context.Context) error {
 	}
 
 	s.hotShotPos = end
-	return nil
+	return false, nil
 }
 
 func (s *Streamer) process(ctx context.Context, hotShotHeight uint64, l1Finalized uint64, txn *espressoCommon.Transaction) {
