@@ -562,7 +562,7 @@ func TestStoreRemovePreservesHotShotOrder(t *testing.T) {
 	require.Equal(t, inserted[2].Hash(), peekBatch(streamer).Hash())
 }
 
-func TestStoreAdvanceWithoutPeekDoesNotMoveTip(t *testing.T) {
+func TestStoreAdvanceWithoutPeekIsANoOp(t *testing.T) {
 	const origin = uint64(3)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 	before := streamer.store.tip()
@@ -570,7 +570,8 @@ func TestStoreAdvanceWithoutPeekDoesNotMoveTip(t *testing.T) {
 	streamer.AdvancePosition()
 
 	require.Equal(t, before, streamer.store.tip(), "tip only moves for a batch that was handed out")
-	require.Equal(t, origin+2, streamer.store.nextBatchPos)
+	require.Equal(t, origin+1, streamer.store.nextBatchPos,
+		"position must not move either: advancing it without the tip wedges peek permanently")
 }
 
 // TestAdvanceAfterWithheldPeekDoesNotMoveTip pins the Peek/AdvancePosition handoff: a
@@ -593,6 +594,23 @@ func TestAdvanceAfterWithheldPeekDoesNotMoveTip(t *testing.T) {
 	streamer.AdvancePosition()
 
 	require.Equal(t, before, streamer.store.tip(), "a withheld batch must not become the tip")
+	require.Equal(t, origin+1, streamer.store.nextBatchPos, "the position must not move for a withheld batch")
+}
+
+// TestAdvanceWithoutPeekLeavesStoreRecoverable pins the no-op: a spurious
+// AdvancePosition must not wedge the store (#485).
+func TestAdvanceWithoutPeekLeavesStoreRecoverable(t *testing.T) {
+	const origin = uint64(1)
+	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
+
+	streamer.AdvancePosition() // nothing was peeked
+
+	batch := chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, 1)
+	streamer.store.insert(batch, BatchAccept)
+
+	got := streamer.Peek(context.Background())
+	require.NotNil(t, got, "a stale advance must leave the store recoverable")
+	require.Equal(t, origin+1, got.Number())
 }
 
 // -----------------------------------------------------------------------------
@@ -700,11 +718,12 @@ func TestPollHotShotIdlesWhenCaughtUp(t *testing.T) {
 	streamer.Stop()
 
 	calls := state.LatestHeightCalls.Load() - before
-	// A paced loop polls the height a handful of times in 200ms at worst; the unpaced
-	// spin reaches tens of thousands. The bound is deliberately generous so the test
-	// pins "no spin" rather than any particular idle interval.
+	// Loose bounds: the upper pins "no spin", the lower proves the loop stayed
+	// alive (a dead loop or error backoff would sit at 0-1 calls).
 	require.LessOrEqual(t, calls, int64(10),
 		"pollHotShot spun on FetchLatestBlockHeight while caught up: %d calls in 200ms", calls)
+	require.GreaterOrEqual(t, calls, int64(2),
+		"the poll loop went quiet instead of pacing: %d calls in 200ms", calls)
 }
 
 // TestPollForFinalityTakesTheFurtherAheadL1View covers reading L1 finality straight from

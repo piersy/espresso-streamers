@@ -210,28 +210,25 @@ func (s *batchStore) remove(batch *derivation.EspressoBatch) {
 }
 
 // advance records that the batch last returned by peek has been consumed: it
-// becomes the tip, so the next peek looks for its child.
+// becomes the tip, so the next peek looks for its child. Without a peeked batch it
+// is a no-op: advancing only the position would wedge peek permanently (#485).
 func (s *batchStore) advance() {
 	s.mu.Lock()
 
-	// Advancing without having handed out a batch leaves the tip pointing at the
-	// consumer's previous block, so nothing at the new position can extend it.
-	stale := s.lastPeeked == nil
-	blockNr, tip := s.nextBatchPos, s.tipHash
-	if !stale {
-		s.tipHash = s.lastPeeked.BatchHeader.Hash()
-		s.lastPeeked = nil
-	}
-	s.nextBatchPos++
-	s.mu.Unlock()
-
-	if stale {
+	if s.lastPeeked == nil {
+		blockNr, tip := s.nextBatchPos, s.tipHash
+		s.mu.Unlock()
 		s.log.Warn(
-			"advanced without a peeked batch, tip is now stale",
+			"advance without a peeked batch, refusing to move the position",
 			"blockNr", blockNr,
 			"tip", tip,
 		)
+		return
 	}
+	s.tipHash = s.lastPeeked.BatchHeader.Hash()
+	s.lastPeeked = nil
+	s.nextBatchPos++
+	s.mu.Unlock()
 }
 
 // setBatchPosition repositions the store onto the tip the caller knows to be
