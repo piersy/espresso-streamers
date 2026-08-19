@@ -385,6 +385,17 @@ func (s *Streamer) getLatestFinalizedL1(ctx context.Context, syncStatusFinalized
 	if header.Number.Uint64() <= syncStatusFinalizedL1.Number {
 		return syncStatusFinalizedL1
 	}
+	head, headErr := s.rollupL1Client.HeaderByNumber(ctx, big.NewInt(int64(rpc.LatestBlockNumber)))
+	if headErr != nil || head == nil || head.Number == nil {
+		s.logger.Warn("ignoring the finalized tag, no L1 head to validate it against",
+			"finalizedTag", header.Number.Uint64(), "err", headErr)
+		return syncStatusFinalizedL1
+	}
+	if header.Number.Uint64() > head.Number.Uint64() {
+		s.logger.Warn("ignoring the finalized tag, finality cannot exceed the L1 head",
+			"finalizedTag", header.Number.Uint64(), "l1Head", head.Number.Uint64())
+		return syncStatusFinalizedL1
+	}
 
 	return eth.L1BlockRef{
 		Number:     header.Number.Uint64(),

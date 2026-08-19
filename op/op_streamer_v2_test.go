@@ -772,6 +772,33 @@ func TestPollForFinalityIgnoresRegressedFinalizedL1(t *testing.T) {
 	require.Equal(t, advanced, streamer.finalizedL1)
 }
 
+// TestPollForFinalityClampsAgainstL1Head pins the fix for celo-org/optimism#483: a
+// finality reading above the L1 head is a bad response and must not latch the view.
+func TestPollForFinalityClampsAgainstL1Head(t *testing.T) {
+	ctx := context.Background()
+	state, streamer := newTestStreamer(t, 42, common.Address{}, 1)
+
+	head := uint64(100)
+	state.L1HeadHeight = &head
+	state.AdvanceFinalizedL1ByNBlocks(10) // honest sync-status view at 11
+	state.FinalizedL2 = createL2BlockRef(5, state.FinalizedL1)
+
+	// One poisoned finalized-tag reading, far above the head.
+	poisoned := uint64(4_000_000)
+	state.L1FinalizedTagHeight = &poisoned
+	streamer.pollForFinality(ctx)
+	require.Equal(t, uint64(11), streamer.finalizedL1.Number,
+		"a reading above the head must be discarded, not adopted")
+
+	// The next honest reading must be adopted and the poll must run to completion.
+	honest := uint64(40)
+	state.L1FinalizedTagHeight = &honest
+	finalizedL2 := streamer.pollForFinality(ctx)
+	require.Equal(t, honest, streamer.finalizedL1.Number)
+	require.NotZero(t, finalizedL2,
+		"the poll must reach the FinalizedL2 return instead of exiting at the regression guard")
+}
+
 // TestFallbackHotshotPosFromLightClient covers the fallback position: the poll loop
 // reads the light client at the finalized L2 block's L1 origin, and that height is what
 // GetFallbackHotshotPos reports.
