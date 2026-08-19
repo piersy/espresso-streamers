@@ -161,6 +161,7 @@ func (s *Streamer) Start(ctx context.Context) error {
 	// Initialize finality
 	primeCtx, cancelPrime := context.WithTimeout(ctx, pollRPCTimeout)
 	s.pollForFinality(primeCtx)
+	s.fastForwardToFallback(primeCtx)
 	cancelPrime()
 
 	s.logger.Info("espresso streamer started",
@@ -280,6 +281,31 @@ func (s *Streamer) pollFinality(ctx context.Context) {
 			s.store.advanceOnFinalization(finalizedL2)
 		}
 	}
+}
+
+// fastForwardToFallback jumps the HotShot cursor to the fallback position computed by
+// the priming finality poll, so a restart resumes near the finalized head instead of
+// rescanning from the configured origin. Startup-only, and only when the fallback
+// does not exceed the HotShot head.
+func (s *Streamer) fastForwardToFallback(ctx context.Context) {
+	fallback := s.GetFallbackHotshotPos()
+	if fallback <= s.hotShotPos {
+		return
+	}
+	head, err := s.espressoClient.FetchLatestBlockHeight(ctx)
+	if err != nil {
+		s.logger.Warn("cannot validate the fallback position against the HotShot head, starting from the origin",
+			"fallbackHotShotPos", fallback, "hotShotPos", s.hotShotPos, "err", err)
+		return
+	}
+	if fallback > head {
+		s.logger.Warn("fallback position is above the HotShot head, starting from the origin",
+			"fallbackHotShotPos", fallback, "hotShotHead", head)
+		return
+	}
+	s.logger.Info("fast-forwarding the HotShot cursor to the fallback position",
+		"from", s.hotShotPos, "to", fallback)
+	s.hotShotPos = fallback
 }
 
 // pollHotShot runs hot: it keeps pulling from HotShot as fast as the query service will

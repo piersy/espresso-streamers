@@ -799,9 +799,38 @@ func TestPollForFinalityClampsAgainstL1Head(t *testing.T) {
 		"the poll must reach the FinalizedL2 return instead of exiting at the regression guard")
 }
 
-// TestFallbackHotshotPosFromLightClient covers the fallback position: the poll loop
-// reads the light client at the finalized L2 block's L1 origin, and that height is what
-// GetFallbackHotshotPos reports.
+// TestFastForwardToFallback covers the fallback position: the cursor jumps from the
+// origin to the fallback only when origin < fallback <= HotShot head; otherwise it
+// stays put, trading speed for safety.
+func TestFastForwardToFallback(t *testing.T) {
+	cases := []struct {
+		name     string
+		fallback uint64
+		headErr  error
+		want     uint64
+	}{
+		{"jumps to a valid fallback", 500, nil, 500},
+		{"fallback above the head: stays at origin", 5000, nil, 0},
+		{"head unavailable: stays at origin", 500, errors.New("query service down"), 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state, streamer := newTestStreamer(t, 42, common.Address{}, 1) // cursor starts at 0
+			state.LatestEspHeight = 998                                    // the HotShot head answers 1000
+			state.FinalizedL2 = createL2BlockRef(20, createL1BlockRef(7))
+			state.FinalizedStateFunc = func(*bind.CallOpts) (FinalizedState, error) {
+				return FinalizedState{BlockHeight: tc.fallback}, nil
+			}
+
+			streamer.pollForFinality(context.Background())
+			state.LatestHeightErr = tc.headErr
+			streamer.fastForwardToFallback(context.Background())
+
+			require.Equal(t, tc.want, streamer.hotShotPos)
+		})
+	}
+}
+
 func TestFallbackHotshotPosFromLightClient(t *testing.T) {
 	ctx := context.Background()
 	const originHotShotPos = uint64(0)

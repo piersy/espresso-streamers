@@ -100,6 +100,9 @@ type MockStreamerSource struct {
 	L1HeadHeight *uint64
 	// HeaderByNumberErr, when set, makes every HeaderByNumber call fail.
 	HeaderByNumberErr error
+
+	// LatestHeightErr, when set, makes every FetchLatestBlockHeight call fail.
+	LatestHeightErr error
 	// HotShotL1Finalized overrides the finalized L1 block reported in the HotShot
 	// header for a given HotShot block height in FetchHeadersByRange. Set an entry
 	// to model HotShot's view of L1 finality diverging from our node's.
@@ -327,6 +330,9 @@ var _ EspressoClient = (*MockStreamerSource)(nil)
 
 func (m *MockStreamerSource) FetchLatestBlockHeight(ctx context.Context) (uint64, error) {
 	m.LatestHeightCalls.Add(1)
+	if m.LatestHeightErr != nil {
+		return 0, m.LatestHeightErr
+	}
 	if m.LatestEspHeight <= math.MaxUint64-2 {
 		return m.LatestEspHeight + 2, nil
 	}
