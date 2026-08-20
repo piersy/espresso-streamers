@@ -153,7 +153,7 @@ func NewStreamer(
 		retryTime:                 retryTime,
 		idlePollInterval:          idlePollInterval,
 		finalityInterval:          defaultFinalityInterval,
-		store:                     newBatchStore(originBatchPos+1, originBatchHash, logger),
+		store:                     newBatchStore(eth.BlockID{Hash: originBatchHash, Number: originBatchPos}, logger),
 		hotShotPos:                originHotShotPos,
 		fallbackHotShotPos:        originHotShotPos,
 		finalizedL1StateCache:     finalizedL1StateCache,
@@ -234,18 +234,16 @@ func (s *Streamer) UnmarshalBatch(b []byte, l1Finalized uint64) (*derivation.Esp
 	return s.unmarshal(b, l1Finalized)
 }
 
-// SetBatchPosition re-anchors the streamer onto l2Head, so the next batch it serves is
-// that block's child. Whatever it was tracking is dropped.
-//
-// The caller picks which head to pass - the safe or the finalized L2 head from its sync
-// status - which is what decides how far derivation is wound back.
-func (s *Streamer) SetBatchPosition(l2Head eth.L2BlockRef) {
+// SetTip resets the streamers tip to the given l2Head, so the next batch it serves is
+// that block's child. This allows re-reading batches from the tip onwards. This is required in the
+// case of a batcher channel reset.
+func (s *Streamer) SetTip(l2Head eth.L2BlockRef) {
 	if l2Head == (eth.L2BlockRef{}) {
-		s.logger.Warn("ignoring batch position with empty L2 head", "tip", s.store.tip())
+		s.logger.Warn("ignoring tip position with empty L2 head", "tip", s.store.tipRef())
 		return
 	}
-	s.logger.Info("setting streamer batch position", "l2Nr", l2Head.Number, "l2Hash", l2Head.Hash.Hex())
-	s.store.setBatchPosition(l2Head.Number+1, l2Head.Hash)
+	s.logger.Info("setting streamer tip position", "l2Nr", l2Head.Number, "l2Hash", l2Head.Hash.Hex())
+	s.store.setTip(l2Head.ID())
 }
 
 // pollFinality keeps the streamer's view of finality current, on an interval. It is

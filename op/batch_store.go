@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/EspressoSystems/espresso-streamers/op/derivation"
+	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
 )
@@ -22,11 +23,13 @@ type batchStore struct {
 	// batches maps L2 block number to the batch for that height.
 	batches map[uint64]*derivation.EspressoBatch
 
-	mu           sync.RWMutex
-	nextBatchPos uint64
+	mu sync.RWMutex
 
-	// tipHash is the block hash of the last batch handed to the consumer
-	tipHash common.Hash
+	// tip is the L2 block the next batch must extend: the last one handed to the
+	// consumer, or the block the store was anchored to if none has been. Number and
+	// hash are held together so they cannot drift - the batch to serve next is always
+	// at tip.Number+1, and its parent must always be tip.Hash.
+	tip eth.BlockID
 	// lastPeeked is the batch most recently returned by peek, remembered so advance
 	// can promote exactly that batch rather than looking the position up again -
 	// advanceOnFinalization may have pruned it in the meantime.
@@ -36,13 +39,18 @@ type batchStore struct {
 	log             log.Logger
 }
 
-func newBatchStore(nextBatchPos uint64, tipHash common.Hash, logger log.Logger) *batchStore {
+func newBatchStore(tip eth.BlockID, logger log.Logger) *batchStore {
 	return &batchStore{
-		batches:      make(map[uint64]*derivation.EspressoBatch),
-		nextBatchPos: nextBatchPos,
-		tipHash:      tipHash,
-		log:          logger,
+		batches: make(map[uint64]*derivation.EspressoBatch),
+		tip:     tip,
+		log:     logger,
 	}
+}
+
+// nextPos is the height of the batch the store serves next. Callers must hold the
+// lock.
+func (s *batchStore) nextPos() uint64 {
+	return s.tip.Number + 1
 }
 
 // insert records a validated batch at its height. The first batch to claim a height
@@ -107,15 +115,15 @@ func (s *batchStore) peek() *derivation.EspressoBatch {
 
 	s.lastPeeked = nil
 
-	next, ok := s.batches[s.nextBatchPos]
+	next, ok := s.batches[s.nextPos()]
 	if !ok {
 		s.mu.Unlock()
 		return nil
 	}
 	// Unreachable by construction, so fail closed rather than handing out a batch we
 	// cannot show extends the chain.
-	if s.tipHash == (common.Hash{}) {
-		blockNr := s.nextBatchPos
+	if s.tip.Hash == (common.Hash{}) {
+		blockNr := s.nextPos()
 		s.mu.Unlock()
 		s.log.Error(
 			"tip hash unset, refusing to serve a batch",
@@ -125,13 +133,13 @@ func (s *batchStore) peek() *derivation.EspressoBatch {
 	}
 	// The batch is valid in itself but builds on a block we did not serve, so serving
 	// it would break the chain. Only a batcher that forked can produce this.
-	if next.BatchHeader.ParentHash != s.tipHash {
-		blockNr, tip, parent := s.nextBatchPos, s.tipHash, next.BatchHeader.ParentHash
+	if next.BatchHeader.ParentHash != s.tip.Hash {
+		blockNr, currentTip, parent := s.nextPos(), s.tip, next.BatchHeader.ParentHash
 		s.mu.Unlock()
 		s.log.Warn(
 			"held batch does not extend the tip",
 			"blockNr", blockNr,
-			"tip", tip,
+			"tip", currentTip,
 			"parentHash", parent,
 		)
 		return nil
@@ -150,12 +158,12 @@ func (s *batchStore) finalizedL2() uint64 {
 	return s.lastFinalizedL2
 }
 
-// tip returns the parent hash the next batch must declare, or the zero hash if no
-// batch has been consumed yet.
-func (s *batchStore) tip() common.Hash {
+// tipRef returns the block the next batch must extend. Its hash is the zero hash if
+// the store has no anchor.
+func (s *batchStore) tipRef() eth.BlockID {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.tipHash
+	return s.tip
 }
 
 // advance records that the batch last returned by peek has been consumed: it
@@ -165,28 +173,26 @@ func (s *batchStore) advance() {
 	s.mu.Lock()
 
 	if s.lastPeeked == nil {
-		blockNr, tip := s.nextBatchPos, s.tipHash
+		blockNr, currentTip := s.nextPos(), s.tip
 		s.mu.Unlock()
 		s.log.Warn(
 			"advance without a peeked batch, refusing to move the position",
 			"blockNr", blockNr,
-			"tip", tip,
+			"tip", currentTip,
 		)
 		return
 	}
-	s.tipHash = s.lastPeeked.BatchHeader.Hash()
+	s.tip = eth.BlockID{Hash: s.lastPeeked.BatchHeader.Hash(), Number: s.lastPeeked.Number()}
 	s.lastPeeked = nil
-	s.nextBatchPos++
 	s.mu.Unlock()
 }
 
-// setBatchPosition repositions the store onto the tip the caller knows to be
-// canonical, dropping whatever it was tracking.
-func (s *batchStore) setBatchPosition(nextBatchPos uint64, tipHash common.Hash) {
+// setTip repositions the store onto the tip the caller knows to be canonical,
+// dropping whatever it was tracking.
+func (s *batchStore) setTip(tip eth.BlockID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.nextBatchPos = nextBatchPos
-	s.tipHash = tipHash
+	s.tip = tip
 	s.lastPeeked = nil
 }
 
@@ -205,7 +211,7 @@ func (s *batchStore) advanceOnFinalization(finalizedL2 uint64) {
 		}
 	}
 	s.lastFinalizedL2 = finalizedL2
-	nextBatchPos, remaining := s.nextBatchPos, len(s.batches)
+	nextBatchPos, remaining := s.nextPos(), len(s.batches)
 	s.mu.Unlock()
 
 	s.log.Info(

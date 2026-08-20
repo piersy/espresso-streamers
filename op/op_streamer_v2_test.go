@@ -127,10 +127,10 @@ func TestNewStreamerSeedsTipFromL2Client(t *testing.T) {
 	const originBatchPos = uint64(7)
 	_, streamer := newTestStreamer(t, 1, common.Address{}, originBatchPos)
 
-	require.Equal(t, createHashFromHeight(originBatchPos), streamer.store.tip(),
-		"tip should be the L2 hash at the anchor position")
-	require.Equal(t, originBatchPos+1, streamer.store.nextBatchPos,
-		"next position should be one past the anchor")
+	require.Equal(t,
+		eth.BlockID{Hash: createHashFromHeight(originBatchPos), Number: originBatchPos},
+		streamer.store.tipRef(),
+		"tip should be the anchor block resolved from the L2 client")
 }
 
 // -----------------------------------------------------------------------------
@@ -358,7 +358,8 @@ func TestStoreServesBatchesInOrderAndAdvancesTip(t *testing.T) {
 
 	require.Equal(t, first.Hash(), streamer.Peek().Hash())
 	streamer.AdvancePosition()
-	require.Equal(t, first.BatchHeader.Hash(), streamer.store.tip(), "consumed batch becomes the tip")
+	require.Equal(t, eth.BlockID{Hash: first.BatchHeader.Hash(), Number: first.Number()},
+		streamer.store.tipRef(), "consumed batch becomes the tip")
 
 	require.Equal(t, second.Hash(), streamer.Peek().Hash())
 	streamer.AdvancePosition()
@@ -468,7 +469,7 @@ func TestStorePeekFailsClosedOnUnsetTip(t *testing.T) {
 	// Forcing the invariant violation: an unset tip must serve nothing rather than
 	// pick a fork by map iteration order.
 	streamer.store.mu.Lock()
-	streamer.store.tipHash = common.Hash{}
+	streamer.store.tip.Hash = common.Hash{}
 	streamer.store.mu.Unlock()
 
 	require.Nil(t, streamer.Peek())
@@ -493,10 +494,9 @@ func TestSetBatchPositionRepositionsAndRetargetsTip(t *testing.T) {
 		{"finalized L2 head", syncStatus.FinalizedL2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			streamer.SetBatchPosition(tc.head)
+			streamer.SetTip(tc.head)
 
-			require.Equal(t, tc.head.Hash, streamer.store.tip())
-			require.Equal(t, tc.head.Number+1, streamer.store.nextBatchPos)
+			require.Equal(t, tc.head.ID(), streamer.store.tipRef())
 		})
 	}
 }
@@ -504,11 +504,11 @@ func TestSetBatchPositionRepositionsAndRetargetsTip(t *testing.T) {
 func TestSetBatchPositionIgnoresEmptyHead(t *testing.T) {
 	const origin = uint64(3)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
-	before := streamer.store.tip()
+	before := streamer.store.tipRef()
 
-	streamer.SetBatchPosition(eth.L2BlockRef{})
-	require.Equal(t, before, streamer.store.tip(), "an empty L2 head must not zero the tip")
-	require.Equal(t, origin+1, streamer.store.nextBatchPos, "nor move the position to 1")
+	streamer.SetTip(eth.L2BlockRef{})
+	require.Equal(t, before, streamer.store.tipRef(),
+		"an empty L2 head must not zero the tip, nor move the position to 1")
 }
 
 func TestStorePrunesFinalizedAndLeavesNoStale(t *testing.T) {
@@ -527,13 +527,12 @@ func TestStorePrunesFinalizedAndLeavesNoStale(t *testing.T) {
 func TestStoreAdvanceWithoutPeekIsANoOp(t *testing.T) {
 	const origin = uint64(3)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
-	before := streamer.store.tip()
+	before := streamer.store.tipRef()
 
 	streamer.AdvancePosition()
 
-	require.Equal(t, before, streamer.store.tip(), "tip only moves for a batch that was handed out")
-	require.Equal(t, origin+1, streamer.store.nextBatchPos,
-		"position must not move either: advancing it without the tip wedges peek permanently")
+	require.Equal(t, before, streamer.store.tipRef(),
+		"the tip only moves for a batch that was handed out: moving the position without it wedges peek permanently")
 }
 
 // TestAdvanceAfterWithheldPeekDoesNotMoveTip pins the Peek/AdvancePosition handoff: a
@@ -546,13 +545,13 @@ func TestAdvanceAfterWithheldPeekDoesNotMoveTip(t *testing.T) {
 	// Held, but on another fork, so Peek withholds it.
 	streamer.store.insert(chainedBatch(origin+1, common.HexToHash("0xotherfork"), common.Address{}, 1))
 
-	before := streamer.store.tip()
+	before := streamer.store.tipRef()
 	require.Nil(t, streamer.Peek(), "a batch off the tip must not be served")
 
 	streamer.AdvancePosition()
 
-	require.Equal(t, before, streamer.store.tip(), "a withheld batch must not become the tip")
-	require.Equal(t, origin+1, streamer.store.nextBatchPos, "the position must not move for a withheld batch")
+	require.Equal(t, before, streamer.store.tipRef(),
+		"a withheld batch must not become the tip, nor move the position")
 }
 
 // TestAdvanceWithoutPeekLeavesStoreRecoverable pins the no-op: a spurious
