@@ -100,6 +100,9 @@ type MockStreamerSource struct {
 	L1HeadHeight *uint64
 	// HeaderByNumberErr, when set, makes every HeaderByNumber call fail.
 	HeaderByNumberErr error
+	// HeaderHashByNumberErr, when set, makes every HeaderHashByNumber call fail, so a
+	// test can model L1 being unreachable while an origin hash is being resolved.
+	HeaderHashByNumberErr error
 
 	// LatestHeightErr, when set, makes every FetchLatestBlockHeight call fail.
 	LatestHeightErr error
@@ -255,6 +258,9 @@ var _ L1Client = (*MockStreamerSource)(nil)
 // L1 Client methods
 
 func (m *MockStreamerSource) HeaderHashByNumber(ctx context.Context, number *big.Int) (common.Hash, error) {
+	if m.HeaderHashByNumberErr != nil {
+		return common.Hash{}, m.HeaderHashByNumberErr
+	}
 	l1Ref := createL1BlockRef(number.Uint64())
 	return l1Ref.Hash, nil
 }

@@ -19,8 +19,6 @@ const (
 	BatchDrop BatchValidity = iota
 	// BatchAccept indicates that the batch is valid and should be processed
 	BatchAccept
-	// BatchUndecided indicates we are lacking L1 information until we can proceed batch filtering
-	BatchUndecided
 	// BatchPast indicates that the batch is at or below the finalized L2 head, so it has
 	// already been derived and there is nothing left to do with it.
 	BatchPast
@@ -32,8 +30,6 @@ func (v BatchValidity) String() string {
 		return "drop"
 	case BatchAccept:
 		return "accept"
-	case BatchUndecided:
-		return "undecided"
 	case BatchPast:
 		return "past"
 	default:

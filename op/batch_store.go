@@ -8,19 +8,19 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 )
 
-// storedBatch is a batch plus the bookkeeping the store owns: the order Espresso
-// delivered it in, which breaks fork ties that map iteration cannot, and the last
-// verdict reached about it.
-type storedBatch struct {
-	batch    *derivation.EspressoBatch
-	order    uint64
-	validity BatchValidity
-}
-
+// batchStore holds the batches the streamer has validated but not yet handed to its
+// consumer, keyed by L2 block number.
+//
+// One batch per height is enough because only fully validated batches get in: the
+// fetch loop defers a HotShot block it cannot decide rather than parking an undecided
+// batch here. Anyone can post to the namespace, but a forged batch is dropped on the
+// signer check before it reaches the store, so a second batch arriving for a height
+// that is already taken means the authorized batcher produced two blocks at one
+// height. The first one HotShot ordered wins - deterministic across streamers, since
+// blocks are processed in HotShot order - and the later one is logged and ignored.
 type batchStore struct {
-	// batches maps L2 block number -> block hash -> the batch for that block. More
-	// than one entry at a number means competing candidates for that slot.
-	batches map[uint64]map[common.Hash]storedBatch
+	// batches maps L2 block number to the batch for that height.
+	batches map[uint64]*derivation.EspressoBatch
 
 	mu           sync.RWMutex
 	nextBatchPos uint64
@@ -28,7 +28,8 @@ type batchStore struct {
 	// tipHash is the block hash of the last batch handed to the consumer
 	tipHash common.Hash
 	// lastPeeked is the batch most recently returned by peek, remembered so advance
-	// can promote exactly that batch to the tip rather than re-selecting it.
+	// can promote exactly that batch rather than looking the position up again -
+	// advanceOnFinalization may have pruned it in the meantime.
 	lastPeeked *derivation.EspressoBatch
 
 	lastFinalizedL2 uint64
@@ -37,14 +38,16 @@ type batchStore struct {
 
 func newBatchStore(nextBatchPos uint64, tipHash common.Hash, logger log.Logger) *batchStore {
 	return &batchStore{
-		batches:      make(map[uint64]map[common.Hash]storedBatch),
+		batches:      make(map[uint64]*derivation.EspressoBatch),
 		nextBatchPos: nextBatchPos,
 		tipHash:      tipHash,
 		log:          logger,
 	}
 }
 
-func (s *batchStore) insert(batch *derivation.EspressoBatch, validity BatchValidity) {
+// insert records a validated batch at its height. The first batch to claim a height
+// keeps it; see the type comment for why a later one is the batcher equivocating.
+func (s *batchStore) insert(batch *derivation.EspressoBatch) {
 	num := batch.Number()
 	parentHash := batch.BatchHeader.ParentHash
 	hash := batch.Hash()
@@ -60,12 +63,19 @@ func (s *batchStore) insert(batch *derivation.EspressoBatch, validity BatchValid
 		return
 	}
 
-	if s.batches[num] == nil {
-		s.batches[num] = make(map[common.Hash]storedBatch)
-	}
-	// Filter duplicate hashes
-	if _, exists := s.batches[num][hash]; exists {
+	if held, taken := s.batches[num]; taken {
 		s.mu.Unlock()
+		// Hashing outside the lock: it is not free, and nothing here needs the lock.
+		if heldHash := held.Hash(); heldHash != hash {
+			s.log.Warn(
+				"ignoring a second batch for a height already held: the authorized batcher produced more than one block here",
+				"batchNr", num,
+				"held", heldHash,
+				"ignored", hash,
+				"parentHash", parentHash,
+			)
+			return
+		}
 		s.log.Info(
 			"ignoring duplicate batch",
 			"batchNr", num,
@@ -74,15 +84,8 @@ func (s *batchStore) insert(batch *derivation.EspressoBatch, validity BatchValid
 		)
 		return
 	}
-	// Keep track of order they came if different hashes for same batch
-	var order uint64
-	for _, candidate := range s.batches[num] {
-		if candidate.order >= order {
-			order = candidate.order + 1
-		}
-	}
-	s.batches[num][hash] = storedBatch{batch: batch, order: order, validity: validity}
-	candidates := len(s.batches[num])
+
+	s.batches[num] = batch
 	s.mu.Unlock()
 
 	s.log.Info(
@@ -90,87 +93,53 @@ func (s *batchStore) insert(batch *derivation.EspressoBatch, validity BatchValid
 		"batchNr", num,
 		"hash", hash,
 		"parentHash", parentHash,
-		"validity", validity,
-		"candidates", candidates,
 	)
 }
 
-// peek returns the batch at the current position that extends the tracked tip and the
-// last verdict about it, remembering the batch so advance can promote it without the
-// caller naming it - hence the write lock. A nil batch comes with a meaningless
-// verdict: BatchDrop is the zero value, not a judgement.
-func (s *batchStore) peek() (*derivation.EspressoBatch, BatchValidity) {
+// peek returns the batch at the current position if it extends the tracked tip,
+// remembering it so advance can promote it without the caller naming it - hence the
+// write lock. Everything the store holds has already been validated, so there is no
+// verdict to reach here and no network call to make.
+func (s *batchStore) peek() *derivation.EspressoBatch {
 	// As in insert, logs are emitted after unlocking so they do not hold off the inserts
 	// coming from the HotShot loop.
 	s.mu.Lock()
 
 	s.lastPeeked = nil
 
-	candidates := s.batches[s.nextBatchPos]
-	if len(candidates) == 0 {
+	next, ok := s.batches[s.nextBatchPos]
+	if !ok {
 		s.mu.Unlock()
-		return nil, BatchDrop
+		return nil
 	}
-	// Unreachable by construction, so fail closed rather than picking a fork by map
-	// iteration order: serving an arbitrary fork is far worse than serving nothing.
+	// Unreachable by construction, so fail closed rather than handing out a batch we
+	// cannot show extends the chain.
 	if s.tipHash == (common.Hash{}) {
-		blockNr, count := s.nextBatchPos, len(candidates)
+		blockNr := s.nextBatchPos
 		s.mu.Unlock()
 		s.log.Error(
-			"tip hash unset, refusing to select a fork",
+			"tip hash unset, refusing to serve a batch",
 			"blockNr", blockNr,
-			"candidates", count,
 		)
-		return nil, BatchDrop
+		return nil
 	}
-	// Earliest in Espresso order among the candidates extending the tip wins.
-	// We keep track of the order from Espresso
-	var next storedBatch
-	for _, candidate := range candidates {
-		if candidate.batch.BatchHeader.ParentHash != s.tipHash {
-			continue
-		}
-		if next.batch == nil || candidate.order < next.order {
-			next = candidate
-		}
-	}
-	if next.batch == nil {
-		blockNr, tip, count := s.nextBatchPos, s.tipHash, len(candidates)
+	// The batch is valid in itself but builds on a block we did not serve, so serving
+	// it would break the chain. Only a batcher that forked can produce this.
+	if next.BatchHeader.ParentHash != s.tipHash {
+		blockNr, tip, parent := s.nextBatchPos, s.tipHash, next.BatchHeader.ParentHash
 		s.mu.Unlock()
-		s.log.Info(
-			"no fork matches tip",
+		s.log.Warn(
+			"held batch does not extend the tip",
 			"blockNr", blockNr,
 			"tip", tip,
-			"candidates", count,
+			"parentHash", parent,
 		)
-		return nil, BatchDrop
+		return nil
 	}
-	s.lastPeeked = next.batch
+
+	s.lastPeeked = next
 	s.mu.Unlock()
-	return next.batch, next.validity
-}
-
-// setValidity records a fresh verdict, ignoring a batch the store no longer holds
-// because a prune or a remove raced the re-check. A verdict other than BatchAccept
-// also withdraws the batch as advance's candidate, since peek stamps lastPeeked before
-// the caller has judged what it handed back.
-func (s *batchStore) setValidity(batch *derivation.EspressoBatch, validity BatchValidity) {
-	num := batch.Number()
-	hash := batch.Hash()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if validity != BatchAccept && s.lastPeeked == batch {
-		s.lastPeeked = nil
-	}
-
-	entry, ok := s.batches[num][hash]
-	if !ok {
-		return
-	}
-	entry.validity = validity
-	s.batches[num][hash] = entry
+	return next
 }
 
 // finalizedL2 returns the highest L2 block number known to be finalized. Batches at
@@ -187,26 +156,6 @@ func (s *batchStore) tip() common.Hash {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.tipHash
-}
-
-// remove evicts a single batch that has been decided invalid, so Peek does not
-// re-check it on every call. The other candidates at this height are left in place -
-// evicting the one Peek just picked is what lets it fall through to the next.
-func (s *batchStore) remove(batch *derivation.EspressoBatch) {
-	num := batch.Number()
-	hash := batch.Hash()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	delete(s.batches[num], hash)
-	if len(s.batches[num]) == 0 {
-		delete(s.batches, num)
-	}
-	// Dropped, so it must never become the tip.
-	if s.lastPeeked == batch {
-		s.lastPeeked = nil
-	}
 }
 
 // advance records that the batch last returned by peek has been consumed: it
@@ -249,18 +198,14 @@ func (s *batchStore) advanceOnFinalization(finalizedL2 uint64) {
 	}
 
 	// Ranging over the heights held, not every number up to finalizedL2: the first call
-	// after startup would otherwise iterate the whole chain under the write lock. The
-	// same pass counts what survives, which is every batch the store still holds.
-	remaining := 0
-	for height, candidates := range s.batches {
+	// after startup would otherwise iterate the whole chain under the write lock.
+	for height := range s.batches {
 		if height <= finalizedL2 {
 			delete(s.batches, height)
-			continue
 		}
-		remaining += len(candidates)
 	}
 	s.lastFinalizedL2 = finalizedL2
-	nextBatchPos := s.nextBatchPos
+	nextBatchPos, remaining := s.nextBatchPos, len(s.batches)
 	s.mu.Unlock()
 
 	s.log.Info(

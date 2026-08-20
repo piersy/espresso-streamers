@@ -174,7 +174,9 @@ func TestCheckBatchAuthorizesL1FinalizedBatcher(t *testing.T) {
 			batch := chainedBatch(10, common.Hash{}, tc.signer, originNumber)
 			batch.L1Finalized = l1FinalizedNumber
 
-			require.Equal(t, tc.want, streamer.checkBatch(context.Background(), batch))
+			got, err := streamer.checkBatch(context.Background(), batch)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
 		})
 	}
 }
@@ -201,19 +203,26 @@ func TestCheckBatchAuthorizesAgainstL1FinalizedNotOrigin(t *testing.T) {
 
 	rotatedOut := chainedBatch(10, common.Hash{}, oldBatcher, originNumber)
 	rotatedOut.L1Finalized = l1FinalizedNumber
-	require.Equal(t, BatchDrop, streamer.checkBatch(context.Background(), rotatedOut),
-		"a batcher authorized only at the declared origin must not be accepted")
+	got, err := streamer.checkBatch(context.Background(), rotatedOut)
+	require.NoError(t, err)
+	require.Equal(t, BatchDrop, got, "a batcher authorized only at the declared origin must not be accepted")
 
 	current := chainedBatch(10, common.Hash{}, newBatcher, originNumber)
 	current.L1Finalized = l1FinalizedNumber
-	require.Equal(t, BatchAccept, streamer.checkBatch(context.Background(), current))
+	got, err = streamer.checkBatch(context.Background(), current)
+	require.NoError(t, err)
+	require.Equal(t, BatchAccept, got)
 }
 
-func TestCheckBatchUndecidedUntilOriginFinalized(t *testing.T) {
+// TestCheckBatchAwaitsOriginFinality covers the one thing checkBatch cannot answer: an
+// authorized batcher's batch declaring an L1 origin we have not finalized. The origin
+// hash cannot be compared against a chain segment that may still change, so it reports
+// how far finality must reach rather than reaching a verdict.
+func TestCheckBatchAwaitsOriginFinality(t *testing.T) {
 	batcher := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	const originNumber = uint64(50)
-	// Below both finality points exercised below, so the anchor is never what
-	// leaves this batch undecided — the origin is.
+	// Below both finality points exercised below, so the anchor is never what holds
+	// this batch up — the origin is.
 	const l1FinalizedNumber = uint64(40)
 
 	_, streamer := newTestStreamer(t, 1, batcher, 1)
@@ -224,11 +233,40 @@ func TestCheckBatchUndecidedUntilOriginFinalized(t *testing.T) {
 
 	// Origin ahead of finalized L1: the origin hash cannot be verified yet.
 	streamer.finalizedL1 = createL1BlockRef(originNumber - 1)
-	require.Equal(t, BatchUndecided, streamer.checkBatch(context.Background(), batch))
+	_, err := streamer.checkBatch(context.Background(), batch)
+
+	var await errAwaitL1Finality
+	require.ErrorAs(t, err, &await, "an unfinalized origin is a wait, not a verdict")
+	require.Equal(t, originNumber, await.height, "it must say how far finality has to reach")
 
 	// Once finality reaches the origin the same batch resolves.
 	streamer.finalizedL1 = createL1BlockRef(originNumber + 1)
-	require.Equal(t, BatchAccept, streamer.checkBatch(context.Background(), batch))
+	got, err := streamer.checkBatch(context.Background(), batch)
+	require.NoError(t, err)
+	require.Equal(t, BatchAccept, got)
+}
+
+// TestCheckBatchPropagatesLookupFailures pins that a failed L1 lookup is an error, not
+// a verdict and not a finality wait: it is transient, so it belongs to the caller's
+// retry backoff rather than making the reader sit until finality moves.
+func TestCheckBatchPropagatesLookupFailures(t *testing.T) {
+	batcher := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	const originNumber = uint64(50)
+	const l1FinalizedNumber = uint64(80)
+
+	state, streamer := newTestStreamer(t, 1, batcher, 1)
+	streamer.finalizedL1 = createL1BlockRef(100)
+	streamer.batcherAtL1FinalizedCache.Add(l1FinalizedNumber, batcher)
+	state.HeaderHashByNumberErr = errors.New("l1 unavailable")
+
+	batch := chainedBatch(10, common.Hash{}, batcher, originNumber)
+	batch.L1Finalized = l1FinalizedNumber
+
+	_, err := streamer.checkBatch(context.Background(), batch)
+	require.ErrorContains(t, err, "l1 unavailable")
+
+	var await errAwaitL1Finality
+	require.NotErrorIs(t, err, error(await), "a lookup failure is not a finality wait")
 }
 
 func TestCheckBatchDropsMismatchedOriginHash(t *testing.T) {
@@ -245,73 +283,32 @@ func TestCheckBatchDropsMismatchedOriginHash(t *testing.T) {
 	// Real L1 reports a different hash at that height than the batch declares.
 	streamer.finalizedL1StateCache.Add(originNumber, l1State{hash: common.HexToHash("0xdeadbeef")})
 
-	require.Equal(t, BatchDrop, streamer.checkBatch(context.Background(), batch))
+	got, err := streamer.checkBatch(context.Background(), batch)
+	require.NoError(t, err)
+	require.Equal(t, BatchDrop, got)
 }
 
-func TestCheckBatchUndecidedBeforeAnyFinalizedL1(t *testing.T) {
-	batcher := common.HexToAddress("0x1111111111111111111111111111111111111111")
-	_, streamer := newTestStreamer(t, 1, batcher, 1)
-	streamer.finalizedL1 = eth.L1BlockRef{}
-
-	batch := chainedBatch(10, common.Hash{}, batcher, 50)
-	batch.L1Finalized = 80
-	require.Equal(t, BatchUndecided, streamer.checkBatch(context.Background(), batch))
-}
-
-// TestCheckBatchWaitsForLocalL1Finality covers the two L1 finality requirements in
-// checkBatch and the order they are applied in. Batcher authorization is resolved at
-// the HotShot header's finalized L1 block, so our local view must have finalized that
-// height before the answer can be trusted — including when the batcher for that height
-// is already cached. The batch's own declared origin is checked only after the signer,
-// so a batch from an unauthorized key naming a far-future origin is dropped rather
-// than parked in the store as undecided.
-func TestCheckBatchWaitsForLocalL1Finality(t *testing.T) {
-	ctx := context.Background()
-
+// TestCheckBatchDropsStrangerBeforeConsideringItsOrigin pins the check order, which is
+// what stops a stranger stalling the reader. Anyone can post to the namespace, so if
+// the declared origin were considered before the signer, a batch naming a far-future
+// origin would hold the reader up for as long as the attacker liked. The signer is
+// checked first, so such a batch is dropped outright and only the authorized batcher
+// can make the reader wait.
+func TestCheckBatchDropsStrangerBeforeConsideringItsOrigin(t *testing.T) {
 	batcher := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	imposter := common.HexToAddress("0x4444444444444444444444444444444444444444")
-
-	const originNumber = uint64(50)
 	const l1Finalized = uint64(80)
 
-	// The anchor's batcher is pre-cached in every case, so nothing here depends on
-	// the finality guard happening to sit in front of the contract call.
-	newStreamer := func(finalizedL1 uint64) *Streamer {
-		_, streamer := newTestStreamer(t, 1, batcher, 1)
-		streamer.finalizedL1 = createL1BlockRef(finalizedL1)
-		streamer.batcherAtL1FinalizedCache.Add(l1Finalized, batcher)
-		return streamer
-	}
+	_, streamer := newTestStreamer(t, 1, batcher, 1)
+	streamer.finalizedL1 = createL1BlockRef(l1Finalized)
+	streamer.batcherAtL1FinalizedCache.Add(l1Finalized, batcher)
 
-	makeBatch := func(signer common.Address, origin uint64) *derivation.EspressoBatch {
-		b := chainedBatch(10, common.Hash{}, signer, origin)
-		b.L1Finalized = l1Finalized
-		return b
-	}
+	stranger := chainedBatch(10, common.Hash{}, imposter, l1Finalized+1_000_000)
+	stranger.L1Finalized = l1Finalized
 
-	t.Run("espresso finalized L1 ahead of local view: undecided", func(t *testing.T) {
-		streamer := newStreamer(l1Finalized - 1)
-		require.Equal(t, BatchUndecided, streamer.checkBatch(ctx, makeBatch(batcher, originNumber)),
-			"must wait for our L1 view to finalize the height the batcher is authorized at")
-	})
-
-	t.Run("local view caught up: accepted", func(t *testing.T) {
-		streamer := newStreamer(l1Finalized)
-		require.Equal(t, BatchAccept, streamer.checkBatch(ctx, makeBatch(batcher, originNumber)))
-	})
-
-	t.Run("unfinalized origin from authorized batcher: undecided", func(t *testing.T) {
-		streamer := newStreamer(l1Finalized)
-		require.Equal(t, BatchUndecided, streamer.checkBatch(ctx, makeBatch(batcher, l1Finalized+1)),
-			"an authorized batcher's batch waits for its origin to finalize")
-	})
-
-	t.Run("far-future origin from unauthorized signer: dropped", func(t *testing.T) {
-		streamer := newStreamer(l1Finalized)
-		require.Equal(t, BatchDrop, streamer.checkBatch(ctx, makeBatch(imposter, l1Finalized+1_000_000)),
-			"an unauthorized signer must be dropped on the spot; an origin it declares "+
-				"itself must not be able to park it in the store as undecided")
-	})
+	got, err := streamer.checkBatch(context.Background(), stranger)
+	require.NoError(t, err, "an unauthorized signer must not be able to make us wait")
+	require.Equal(t, BatchDrop, got)
 }
 
 // TestCheckBatchPastAtOrBelowFinalizedL2 covers batches that finalization has already
@@ -327,7 +324,9 @@ func TestCheckBatchPastAtOrBelowFinalizedL2(t *testing.T) {
 
 		batch := chainedBatch(l2Number, common.Hash{}, batcher, 50)
 		batch.L1Finalized = 80
-		require.Equal(t, BatchPast, streamer.checkBatch(context.Background(), batch),
+		got, err := streamer.checkBatch(context.Background(), batch)
+		require.NoError(t, err)
+		require.Equal(t, BatchPast, got,
 			"batch %d is at or below the finalized L2 head %d", l2Number, finalizedL2)
 	}
 }
@@ -336,74 +335,56 @@ func TestCheckBatchPastAtOrBelowFinalizedL2(t *testing.T) {
 // Store: tip tracking, competing candidates, pruning
 // -----------------------------------------------------------------------------
 
-// acceptedBatch stores a batch already marked BatchAccept, so Peek serves it
-// without re-deriving validity. Lets the store's behaviour be tested on its own.
+// acceptedBatch stores a batch directly, as the fetch loop does once it has validated
+// one. Lets the store's behaviour be tested on its own.
 func acceptedBatch(t *testing.T, s *Streamer, l2Number uint64, parentHash common.Hash) *derivation.EspressoBatch {
 	t.Helper()
 	b := chainedBatch(l2Number, parentHash, common.Address{}, 1)
-	s.store.insert(b, BatchAccept)
+	s.store.insert(b)
 	return b
 }
 
 func TestPeekEmptyStore(t *testing.T) {
 	_, streamer := newTestStreamer(t, 42, common.Address{}, 1)
-	require.Nil(t, streamer.Peek(context.Background()))
+	require.Nil(t, streamer.Peek())
 }
 
 func TestStoreServesBatchesInOrderAndAdvancesTip(t *testing.T) {
 	const origin = uint64(1)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
-	ctx := context.Background()
 
 	first := acceptedBatch(t, streamer, origin+1, createHashFromHeight(origin))
 	second := acceptedBatch(t, streamer, origin+2, first.BatchHeader.Hash())
 
-	require.Equal(t, first.Hash(), streamer.Peek(ctx).Hash())
+	require.Equal(t, first.Hash(), streamer.Peek().Hash())
 	streamer.AdvancePosition()
 	require.Equal(t, first.BatchHeader.Hash(), streamer.store.tip(), "consumed batch becomes the tip")
 
-	require.Equal(t, second.Hash(), streamer.Peek(ctx).Hash())
+	require.Equal(t, second.Hash(), streamer.Peek().Hash())
 	streamer.AdvancePosition()
 
-	require.Nil(t, streamer.Peek(ctx), "nothing left to serve")
+	require.Nil(t, streamer.Peek(), "nothing left to serve")
 }
 
-// TestStoreKeepsCompetingCandidatesWithSameParent is the regression test for a batch
-// being lost: a bad batch (an L1 origin that gets reorged out) arrives first and sits
-// Undecided, then the valid batch for the same slot arrives with the same parent hash.
-// Deduplicating on parent hash discarded the valid one, leaving the position dead once
-// the bad batch was finally dropped.
-func TestStoreKeepsCompetingCandidatesWithSameParent(t *testing.T) {
-	batcher := common.HexToAddress("0x1111111111111111111111111111111111111111")
+// TestStoreKeepsFirstBatchAtAHeight pins the one-batch-per-height rule. Only validated
+// batches reach the store, so a second batch for a height already held can only be the
+// authorized batcher producing two blocks at one height. HotShot's order decides it,
+// and blocks are processed in that order, so the first insert wins.
+func TestStoreKeepsFirstBatchAtAHeight(t *testing.T) {
 	const origin = uint64(1)
-	const l1Finalized = uint64(80)
-	const badOrigin = uint64(50)
-	const goodOrigin = uint64(60)
-
-	_, streamer := newTestStreamer(t, 42, batcher, origin)
-	ctx := context.Background()
+	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 	parent := createHashFromHeight(origin)
 
-	streamer.batcherAtL1FinalizedCache.Add(l1Finalized, batcher)
-	// Both origins are finalized, but the bad one's hash does not match L1.
-	streamer.finalizedL1 = createL1BlockRef(100)
-	streamer.finalizedL1StateCache.Add(badOrigin, l1State{hash: common.HexToHash("0xreorged")})
-	streamer.finalizedL1StateCache.Add(goodOrigin, l1State{hash: createHashFromHeight(goodOrigin)})
+	first := chainedBatch(origin+1, parent, common.Address{}, 10)
+	second := chainedBatch(origin+1, parent, common.Address{}, 11)
+	require.NotEqual(t, first.Hash(), second.Hash(), "the two must be distinguishable")
 
-	bad := chainedBatch(origin+1, parent, batcher, badOrigin)
-	bad.L1Finalized = l1Finalized
-	streamer.store.insert(bad, BatchUndecided)
+	streamer.store.insert(first)
+	streamer.store.insert(second)
 
-	good := chainedBatch(origin+1, parent, batcher, goodOrigin)
-	good.L1Finalized = l1Finalized
-	streamer.store.insert(good, BatchUndecided)
-
-	require.Equal(t, 2, storeTotal(streamer), "both candidates must be retained")
-
-	// Peek drops the bad candidate and falls through to the good one in one call.
-	got := streamer.Peek(ctx)
-	require.NotNil(t, got, "the valid batch must still be reachable")
-	require.Equal(t, good.Hash(), got.Hash())
+	require.Equal(t, 1, storeTotal(streamer), "a height holds one batch")
+	require.Equal(t, first.Hash(), storedAt(streamer, origin+1).Hash(), "the first one keeps the height")
+	require.Equal(t, first.Hash(), streamer.Peek().Hash())
 }
 
 func TestStoreIgnoresDuplicateBatchHash(t *testing.T) {
@@ -415,34 +396,37 @@ func TestStoreIgnoresDuplicateBatchHash(t *testing.T) {
 	again := chainedBatch(origin+1, parent, common.Address{}, 1)
 	require.Equal(t, first.Hash(), again.Hash(), "same contents must hash the same")
 
-	streamer.store.insert(first, BatchAccept)
-	streamer.store.insert(again, BatchAccept)
+	streamer.store.insert(first)
+	streamer.store.insert(again)
 
 	require.Equal(t, 1, storeTotal(streamer), "an identical batch must not be stored twice")
 }
 
+// TestStorePeekWithholdsBatchNotExtendingTip covers the parent-hash guard that survives
+// the move to one batch per height: the batch is valid in itself but builds on a block
+// the streamer did not serve, so serving it would break the chain.
+func TestStorePeekWithholdsBatchNotExtendingTip(t *testing.T) {
+	const origin = uint64(1)
+	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
+
+	streamer.store.insert(chainedBatch(origin+1, common.HexToHash("0xotherfork"), common.Address{}, 1))
+
+	require.Nil(t, streamer.Peek(),
+		"a batch whose parent is not the tip must not be served")
+}
+
 // storeTotal reads the store's batch count under its lock.
-// peekBatch returns just the batch from the store's peek, discarding the verdict.
-func peekBatch(s *Streamer) *derivation.EspressoBatch {
-	batch, _ := s.store.peek()
-	return batch
-}
-
-// storeValidity reads the verdict the store recorded for a batch, under its lock.
-func storeValidity(s *Streamer, batch *derivation.EspressoBatch) BatchValidity {
-	s.store.mu.RLock()
-	defer s.store.mu.RUnlock()
-	return s.store.batches[batch.Number()][batch.Hash()].validity
-}
-
 func storeTotal(s *Streamer) int {
 	s.store.mu.RLock()
 	defer s.store.mu.RUnlock()
-	total := 0
-	for _, candidates := range s.store.batches {
-		total += len(candidates)
-	}
-	return total
+	return len(s.store.batches)
+}
+
+// storedAt returns the batch the store holds at a height, or nil.
+func storedAt(s *Streamer, l2Number uint64) *derivation.EspressoBatch {
+	s.store.mu.RLock()
+	defer s.store.mu.RUnlock()
+	return s.store.batches[l2Number]
 }
 
 // storeHasStale reports whether the store still holds a batch at or below the height it
@@ -461,19 +445,18 @@ func storeHasStale(s *Streamer) bool {
 func TestStoreOutOfOrderInsertsServedInOrder(t *testing.T) {
 	const origin = uint64(1)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
-	ctx := context.Background()
 
 	// Build the chain, then insert the child before the parent.
 	first := chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, 1)
 	second := chainedBatch(origin+2, first.BatchHeader.Hash(), common.Address{}, 1)
 
-	streamer.store.insert(second, BatchAccept)
-	require.Nil(t, streamer.Peek(ctx), "the later batch must not be served early")
+	streamer.store.insert(second)
+	require.Nil(t, streamer.Peek(), "the later batch must not be served early")
 
-	streamer.store.insert(first, BatchAccept)
-	require.Equal(t, first.Hash(), streamer.Peek(ctx).Hash())
+	streamer.store.insert(first)
+	require.Equal(t, first.Hash(), streamer.Peek().Hash())
 	streamer.AdvancePosition()
-	require.Equal(t, second.Hash(), streamer.Peek(ctx).Hash())
+	require.Equal(t, second.Hash(), streamer.Peek().Hash())
 }
 
 func TestStorePeekFailsClosedOnUnsetTip(t *testing.T) {
@@ -488,7 +471,7 @@ func TestStorePeekFailsClosedOnUnsetTip(t *testing.T) {
 	streamer.store.tipHash = common.Hash{}
 	streamer.store.mu.Unlock()
 
-	require.Nil(t, streamer.Peek(context.Background()))
+	require.Nil(t, streamer.Peek())
 }
 
 // TestSetBatchPositionRepositionsAndRetargetsTip covers both heads a caller can anchor
@@ -541,27 +524,6 @@ func TestStorePrunesFinalizedAndLeavesNoStale(t *testing.T) {
 	require.False(t, storeHasStale(streamer), "nothing may survive at or below the finalized height")
 }
 
-func TestStoreRemovePreservesHotShotOrder(t *testing.T) {
-	const origin = uint64(1)
-	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
-	parent := createHashFromHeight(origin)
-
-	// Three competitors for one slot, distinguished by their declared L1 origin.
-	var inserted []*derivation.EspressoBatch
-	for _, o := range []uint64{10, 11, 12} {
-		b := chainedBatch(origin+1, parent, common.Address{}, o)
-		streamer.store.insert(b, BatchAccept)
-		inserted = append(inserted, b)
-	}
-
-	// Dropping the head must promote the next in order, not swap the last one in.
-	streamer.store.remove(inserted[0])
-	require.Equal(t, inserted[1].Hash(), peekBatch(streamer).Hash())
-
-	streamer.store.remove(inserted[1])
-	require.Equal(t, inserted[2].Hash(), peekBatch(streamer).Hash())
-}
-
 func TestStoreAdvanceWithoutPeekIsANoOp(t *testing.T) {
 	const origin = uint64(3)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
@@ -575,21 +537,17 @@ func TestStoreAdvanceWithoutPeekIsANoOp(t *testing.T) {
 }
 
 // TestAdvanceAfterWithheldPeekDoesNotMoveTip pins the Peek/AdvancePosition handoff: a
-// batch Peek withheld as undecided must not become the tip if the consumer advances
-// anyway, which would adopt a block nobody derived.
+// batch Peek withheld must not become the tip if the consumer advances anyway, which
+// would adopt a block nobody derived.
 func TestAdvanceAfterWithheldPeekDoesNotMoveTip(t *testing.T) {
-	batcher := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	const origin = uint64(1)
-	_, streamer := newTestStreamer(t, 42, batcher, origin)
-	// No finalized L1 yet, so the re-check inside Peek returns BatchUndecided.
-	streamer.finalizedL1 = eth.L1BlockRef{}
+	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 
-	batch := chainedBatch(origin+1, createHashFromHeight(origin), batcher, 50)
-	batch.L1Finalized = 80
-	streamer.store.insert(batch, BatchUndecided)
+	// Held, but on another fork, so Peek withholds it.
+	streamer.store.insert(chainedBatch(origin+1, common.HexToHash("0xotherfork"), common.Address{}, 1))
 
 	before := streamer.store.tip()
-	require.Nil(t, streamer.Peek(context.Background()), "an undecided batch must not be served")
+	require.Nil(t, streamer.Peek(), "a batch off the tip must not be served")
 
 	streamer.AdvancePosition()
 
@@ -606,9 +564,9 @@ func TestAdvanceWithoutPeekLeavesStoreRecoverable(t *testing.T) {
 	streamer.AdvancePosition() // nothing was peeked
 
 	batch := chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, 1)
-	streamer.store.insert(batch, BatchAccept)
+	streamer.store.insert(batch)
 
-	got := streamer.Peek(context.Background())
+	got := streamer.Peek()
 	require.NotNil(t, got, "a stale advance must leave the store recoverable")
 	require.Equal(t, origin+1, got.Number())
 }
@@ -642,11 +600,11 @@ func TestFetchStoresAndServesSignedBatch(t *testing.T) {
 	_, err = streamer.fetchEspressoTransactions(ctx)
 	require.NoError(t, err)
 
-	got := streamer.Peek(ctx)
+	got := streamer.Peek()
 	require.NotNil(t, got, "the signed batch should have been stored and accepted")
 	require.Equal(t, batch.Number(), got.Number())
 	require.Equal(t, signerAddress, got.SignerAddress, "signer is recovered from the signature")
-	require.Equal(t, BatchAccept, storeValidity(streamer, got), "Peek must only serve accepted batches")
+	require.Equal(t, 1, storeTotal(streamer), "only the one validated batch is held")
 }
 
 // TestFetchDropsForeignSignedBatch is the same path with a batch signed by a key that
@@ -674,19 +632,220 @@ func TestFetchDropsForeignSignedBatch(t *testing.T) {
 	_, err = streamer.fetchEspressoTransactions(ctx)
 	require.NoError(t, err)
 
-	require.Nil(t, streamer.Peek(ctx), "a batch signed by an unauthorized key must be dropped")
+	require.Nil(t, streamer.Peek(), "a batch signed by an unauthorized key must be dropped")
 	require.Zero(t, storeTotal(streamer), "it must not even be stored")
+}
+
+// -----------------------------------------------------------------------------
+// Fetch path: deferring until L1 finality catches up
+// -----------------------------------------------------------------------------
+
+// signedBatchStreamer builds a streamer whose authorized batcher is the test key, and
+// returns a helper that publishes a batch signed by that key into a HotShot block.
+// The fetch path recovers the signer from the signature, so batches must be signed
+// rather than merely carry a SignerAddress.
+func signedBatchStreamer(t *testing.T, namespace, originBatchPos uint64) (
+	*MockStreamerSource, *Streamer, func(hotShotHeight uint64, batch *derivation.EspressoBatch),
+) {
+	t.Helper()
+
+	factory, signerAddress, err := crypto.ChainSignerFactoryFromConfig(&NoOpLogger{}, testPrivateKey, "", "", opsigner.CLIConfig{})
+	require.NoError(t, err)
+	chainSigner := factory(big.NewInt(int64(namespace)), common.Address{})
+
+	state, streamer := newTestStreamer(t, namespace, signerAddress, originBatchPos)
+
+	publish := func(hotShotHeight uint64, batch *derivation.EspressoBatch) {
+		t.Helper()
+		txn := createEspressoTransaction(context.Background(), batch, namespace, chainSigner)
+		state.AddEspressoTransactionData(hotShotHeight, namespace, createTransactionsInBlock(txn))
+	}
+	return state, streamer, publish
+}
+
+// TestFetchDefersBlockWhoseAnchorIsNotFinalizedLocally covers the first deferral: the
+// batcher authorized for a HotShot block is resolved at the L1 height the block's
+// header names as finalized, so until our own view has finalized that height the answer
+// could come from a chain segment that still changes - which is how a rotated-out key
+// would slip through. The block is left unread rather than judged early.
+func TestFetchDefersBlockWhoseAnchorIsNotFinalizedLocally(t *testing.T) {
+	ctx := context.Background()
+	const namespace, origin = uint64(42), uint64(1)
+
+	state, streamer, publish := signedBatchStreamer(t, namespace, origin)
+
+	batch := chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, state.FinalizedL1.Number)
+	publish(0, batch)
+	// HotShot saw an L1 finality five blocks beyond ours.
+	aheadOfUs := state.FinalizedL1.Number + 5
+	state.HotShotL1Finalized = map[uint64]uint64{0: aheadOfUs}
+
+	streamer.pollForFinality(ctx)
+	idle, err := streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
+	require.True(t, idle, "nothing could be judged, so the pass made no progress")
+	require.Zero(t, streamer.hotShotPos, "the block must be left to be read again")
+	require.Zero(t, storeTotal(streamer), "nothing may be stored before its anchor is finalized")
+
+	// Our view reaches the anchor, and the same block is accepted.
+	state.AdvanceFinalizedL1ByNBlocks(5)
+	streamer.pollForFinality(ctx)
+	_, err = streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
+
+	got := streamer.Peek()
+	require.NotNil(t, got, "the deferred batch must be picked up once finality catches up")
+	require.Equal(t, batch.Number(), got.Number())
+}
+
+// TestFetchDefersBatchWhoseOriginIsNotFinalized covers the second deferral: the L1
+// origin is declared inside the batch, so it is only known once the block has been
+// read. A batch naming an origin we have not finalized cannot be judged, and dropping
+// it would lose it for good because hotShotPos never rewinds.
+func TestFetchDefersBatchWhoseOriginIsNotFinalized(t *testing.T) {
+	ctx := context.Background()
+	const namespace, origin = uint64(42), uint64(1)
+
+	state, streamer, publish := signedBatchStreamer(t, namespace, origin)
+
+	// The block's anchor is fine; the batch names an origin beyond our finality.
+	futureOrigin := state.FinalizedL1.Number + 5
+	publish(0, chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, futureOrigin))
+
+	streamer.pollForFinality(ctx)
+	idle, err := streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
+	require.True(t, idle, "the pass stopped at the block it could not judge")
+	require.Zero(t, streamer.hotShotPos, "the block carrying it must be read again")
+	require.Zero(t, storeTotal(streamer), "an undecided batch must never be stored")
+
+	state.AdvanceFinalizedL1ByNBlocks(5)
+	streamer.pollForFinality(ctx)
+	_, err = streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
+
+	got := streamer.Peek()
+	require.NotNil(t, got, "the batch resolves once its origin finalizes")
+	require.Equal(t, origin+1, got.Number())
+}
+
+// TestFetchIsNotStalledByAStrangersFarFutureOrigin is the liveness counterpart to the
+// deferral: waiting on an L1 origin is safe only because the signer is checked first.
+// Anyone can post to the namespace, so if a stranger's declared origin could make the
+// reader wait, a single junk batch would stall the streamer for as long as it liked.
+func TestFetchIsNotStalledByAStrangersFarFutureOrigin(t *testing.T) {
+	ctx := context.Background()
+	const namespace, origin = uint64(42), uint64(1)
+
+	factory, signerAddress, err := crypto.ChainSignerFactoryFromConfig(&NoOpLogger{}, testPrivateKey, "", "", opsigner.CLIConfig{})
+	require.NoError(t, err)
+	chainSigner := factory(big.NewInt(int64(namespace)), common.Address{})
+
+	// The authorized batcher is somebody else, so the signing key is a stranger.
+	authorized := common.HexToAddress("0x9999999999999999999999999999999999999999")
+	require.NotEqual(t, authorized, signerAddress)
+	state, streamer := newTestStreamer(t, namespace, authorized, origin)
+
+	far := chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, state.FinalizedL1.Number+1_000_000)
+	state.AddEspressoTransactionData(0, namespace, createTransactionsInBlock(
+		createEspressoTransaction(ctx, far, namespace, chainSigner)))
+
+	streamer.pollForFinality(ctx)
+	idle, err := streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
+	require.False(t, idle, "a stranger's batch must not hold the reader up")
+	require.NotZero(t, streamer.hotShotPos, "the cursor must move past it")
+	require.Zero(t, streamer.pendingL1, "and it must not put the reader into a finality wait")
+	require.Zero(t, storeTotal(streamer), "the batch itself is dropped")
+}
+
+// TestFetchSkipsRereadUntilFinalityMoves pins the guard that keeps a deferral cheap:
+// while finality has not moved, re-reading the range could only reach the same point,
+// so the streamer does not even ask for the HotShot height.
+func TestFetchSkipsRereadUntilFinalityMoves(t *testing.T) {
+	ctx := context.Background()
+	const namespace, origin = uint64(42), uint64(1)
+
+	state, streamer, publish := signedBatchStreamer(t, namespace, origin)
+	publish(0, chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, state.FinalizedL1.Number+5))
+
+	streamer.pollForFinality(ctx)
+	_, err := streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
+	require.Zero(t, streamer.hotShotPos, "precondition: the pass deferred")
+
+	before := state.LatestHeightCalls.Load()
+	idle, err := streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
+	require.True(t, idle)
+	require.Equal(t, before, state.LatestHeightCalls.Load(),
+		"with finality unmoved there is nothing to re-read")
+
+	// A finality advance makes it worth looking again.
+	state.AdvanceFinalizedL1ByNBlocks(5)
+	streamer.pollForFinality(ctx)
+	_, err = streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
+	require.Greater(t, state.LatestHeightCalls.Load(), before, "a finality advance must resume reading")
+}
+
+// TestFetchProcessesUpToTheDeferralPoint covers a partial pass: blocks before the one
+// that cannot be judged are processed and the cursor keeps what it earned, so a single
+// undecidable block does not hold up the whole range.
+func TestFetchProcessesUpToTheDeferralPoint(t *testing.T) {
+	ctx := context.Background()
+	const namespace, origin = uint64(42), uint64(1)
+
+	state, streamer, publish := signedBatchStreamer(t, namespace, origin)
+
+	first := chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, state.FinalizedL1.Number)
+	second := chainedBatch(origin+2, first.BatchHeader.Hash(), common.Address{}, state.FinalizedL1.Number)
+	publish(0, first)
+	publish(1, second)
+	// The second block's anchor is beyond our view; the first block's is not.
+	state.HotShotL1Finalized = map[uint64]uint64{1: state.FinalizedL1.Number + 5}
+
+	streamer.pollForFinality(ctx)
+	idle, err := streamer.fetchEspressoTransactions(ctx)
+	require.NoError(t, err)
+	require.False(t, idle, "the pass made progress, even though it stopped short")
+	require.Equal(t, uint64(1), streamer.hotShotPos, "the cursor stops at the block it could not judge")
+	require.Equal(t, 1, storeTotal(streamer), "only the block it could judge was stored")
+
+	got := streamer.Peek()
+	require.NotNil(t, got)
+	require.Equal(t, first.Number(), got.Number())
 }
 
 // TestFetchRejectsOverflowingEspressoHeight covers the guard on the reported HotShot
 // height: at the maximum, the range's exclusive end would wrap to zero.
 func TestFetchRejectsOverflowingEspressoHeight(t *testing.T) {
+	ctx := context.Background()
 	state, streamer := newTestStreamer(t, 42, common.Address{}, 1)
 	state.LatestEspHeight = math.MaxUint64
 
-	_, err := streamer.fetchEspressoTransactions(context.Background())
+	// A finality view is a precondition for reading at all, so establish one before
+	// the guard under test can be reached.
+	streamer.pollForFinality(ctx)
+
+	_, err := streamer.fetchEspressoTransactions(ctx)
 	require.ErrorContains(t, err, "overflows uint64")
 	require.Zero(t, streamer.hotShotPos, "the position must not move on a rejected height")
+}
+
+// TestFetchWaitsForAFinalityView covers the precondition: with no finalized L1 known,
+// nothing can be judged, so the streamer reads nothing rather than pulling batches it
+// would have to store undecided.
+func TestFetchWaitsForAFinalityView(t *testing.T) {
+	state, streamer := newTestStreamer(t, 42, common.Address{}, 1)
+	streamer.finalizedL1 = eth.L1BlockRef{}
+
+	before := state.LatestHeightCalls.Load()
+	idle, err := streamer.fetchEspressoTransactions(context.Background())
+	require.NoError(t, err)
+	require.True(t, idle, "no finality view means no progress, so the loop should pace")
+	require.Zero(t, streamer.hotShotPos, "the position must not move")
+	require.Equal(t, before, state.LatestHeightCalls.Load(), "it must not even ask for the height")
 }
 
 func TestFetchNoOpWhenCaughtUp(t *testing.T) {
@@ -697,9 +856,10 @@ func TestFetchNoOpWhenCaughtUp(t *testing.T) {
 	require.NoError(t, err)
 
 	streamer.hotShotPos = latest
-	caughtUp, err := streamer.fetchEspressoTransactions(ctx)
+	streamer.pollForFinality(ctx)
+	idle, err := streamer.fetchEspressoTransactions(ctx)
 	require.NoError(t, err)
-	require.True(t, caughtUp, "the caught-up path must report itself so the poll loop can pace")
+	require.True(t, idle, "the caught-up path must report itself so the poll loop can pace")
 	require.Equal(t, latest, streamer.hotShotPos, "position must not move when already caught up")
 }
 
