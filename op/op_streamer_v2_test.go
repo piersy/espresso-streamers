@@ -323,6 +323,9 @@ func TestCheckBatchPastAtOrBelowFinalizedL2(t *testing.T) {
 
 	for _, l2Number := range []uint64{finalizedL2 - 1, finalizedL2} {
 		_, streamer := newTestStreamer(t, 42, batcher, 1)
+		// The consumer has processed up to the finalized head; the watermark never
+		// passes the cursor so it must be anchored there first.
+		streamer.SetBatchPosition(eth.L2BlockRef{Number: finalizedL2, Hash: createHashFromHeight(finalizedL2)})
 		streamer.store.advanceOnFinalization(finalizedL2)
 
 		batch := chainedBatch(l2Number, common.Hash{}, batcher, 50)
@@ -535,10 +538,32 @@ func TestStorePrunesFinalizedAndLeavesNoStale(t *testing.T) {
 	first := acceptedBatch(t, streamer, origin+1, createHashFromHeight(origin))
 	acceptedBatch(t, streamer, origin+2, first.BatchHeader.Hash())
 
+	require.NotNil(t, streamer.Peek(context.Background()))
+	streamer.AdvancePosition()
+
 	streamer.store.advanceOnFinalization(origin + 1)
 
 	require.Equal(t, 1, storeTotal(streamer), "the finalized slot should be gone")
 	require.False(t, storeHasStale(streamer), "nothing may survive at or below the finalized height")
+}
+
+// Finalization pruning must not delete the slot the cursor points at or anything above it, and the
+// watermark must cap at cursor-1, so parked candidates stay reachable and re-checkable
+// after finality overtakes a stalled consumer.
+func TestPruneNeverPassesTheCursor(t *testing.T) {
+	const origin = uint64(4)
+	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
+
+	parked := chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, 1)
+	streamer.store.insert(parked, BatchUndecided)
+
+	streamer.store.advanceOnFinalization(origin + 3) // finality overtakes the stalled cursor
+
+	require.Equal(t, 1, storeTotal(streamer), "the cursor's slot must survive pruning")
+	require.Equal(t, origin, streamer.store.finalizedL2(),
+		"the watermark must cap at cursor-1 so the parked batch is not verdicted Past")
+	got, _ := streamer.store.peek()
+	require.NotNil(t, got, "peek must still see the parked candidate")
 }
 
 func TestStoreRemovePreservesHotShotOrder(t *testing.T) {

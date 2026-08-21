@@ -31,6 +31,9 @@ type batchStore struct {
 	// can promote exactly that batch to the tip rather than re-selecting it.
 	lastPeeked *derivation.EspressoBatch
 
+	// lastFinalizedL2 is the store's prune-and-reject watermark. It tracks the
+	// finalized L2 height but never passes the cursor so it may lag actual
+	// finality; lagging only keeps batches longer, it gates nothing.
 	lastFinalizedL2 uint64
 	log             log.Logger
 }
@@ -235,15 +238,37 @@ func (s *batchStore) advance() {
 // canonical, dropping whatever it was tracking.
 func (s *batchStore) setBatchPosition(nextBatchPos uint64, tipHash common.Hash) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.nextBatchPos = nextBatchPos
 	s.tipHash = tipHash
 	s.lastPeeked = nil
+	// A re-anchor is the consumer asserting the canonical position; a watermark at or
+	// above it is definitionally stale and would reject inserts the consumer now needs.
+	watermarkWas, lowered := s.lastFinalizedL2, false
+	if nextBatchPos > 0 && s.lastFinalizedL2 >= nextBatchPos {
+		s.lastFinalizedL2 = nextBatchPos - 1
+		lowered = true
+	}
+	s.mu.Unlock()
+
+	if lowered {
+		s.log.Info(
+			"re-anchor moved the position below the watermark, lowering it",
+			"nextBatchPos", nextBatchPos,
+			"watermarkWas", watermarkWas,
+			"watermarkNow", nextBatchPos-1,
+		)
+	}
 }
 
 func (s *batchStore) advanceOnFinalization(finalizedL2 uint64) {
 	s.mu.Lock()
-	if finalizedL2 <= s.lastFinalizedL2 {
+	// Never prune the cursor's slot or anything above it: peek only ever reads the
+	// cursor's slot, so deleting it strands every held candidate for good.
+	pruneUpTo := finalizedL2
+	if s.nextBatchPos > 0 && pruneUpTo >= s.nextBatchPos {
+		pruneUpTo = s.nextBatchPos - 1
+	}
+	if pruneUpTo <= s.lastFinalizedL2 {
 		s.mu.Unlock()
 		return
 	}
@@ -253,19 +278,20 @@ func (s *batchStore) advanceOnFinalization(finalizedL2 uint64) {
 	// same pass counts what survives, which is every batch the store still holds.
 	remaining := 0
 	for height, candidates := range s.batches {
-		if height <= finalizedL2 {
+		if height <= pruneUpTo {
 			delete(s.batches, height)
 			continue
 		}
 		remaining += len(candidates)
 	}
-	s.lastFinalizedL2 = finalizedL2
+	s.lastFinalizedL2 = pruneUpTo
 	nextBatchPos := s.nextBatchPos
 	s.mu.Unlock()
 
 	s.log.Info(
 		"pruned finalized slots",
 		"finalizedL2", finalizedL2,
+		"prunedUpTo", pruneUpTo,
 		"nextBatchPos", nextBatchPos,
 		"batches", remaining,
 	)
