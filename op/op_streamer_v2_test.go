@@ -933,35 +933,22 @@ func TestPollHotShotIdlesWhenCaughtUp(t *testing.T) {
 		"the poll loop went quiet instead of pacing: %d calls in 200ms", calls)
 }
 
-// TestPollForFinalityTakesTheFurtherAheadL1View covers reading L1 finality straight from
-// the chain alongside the sync status: op-node polls the finalized tag only every
-// l1.epoch-poll-interval, so its view can trail the chain and every batch waiting on its
-// origin to finalize pays for the lag.
-func TestPollForFinalityTakesTheFurtherAheadL1View(t *testing.T) {
+// TestPollForFinalityKeepsViewWhenL1Unreadable covers the transient failure: with no
+// usable reading the previous view stands rather than being cleared or advanced.
+func TestPollForFinalityKeepsViewWhenL1Unreadable(t *testing.T) {
 	ctx := context.Background()
 	state, streamer := newTestStreamer(t, 42, common.Address{}, 1)
 
-	// Sync status stuck at 11 while the chain has finalized 40.
+	settled := uint64(40)
 	state.AdvanceFinalizedL1ByNBlocks(10)
-	ahead := uint64(40)
-	state.L1FinalizedTagHeight = &ahead
-
+	state.L1FinalizedTagHeight = &settled
 	streamer.pollForFinality(ctx)
-	require.Equal(t, ahead, streamer.finalizedL1.Number,
-		"the chain's own finalized tag is further ahead, so it should win")
+	require.Equal(t, settled, streamer.finalizedL1.Number)
 
-	// The reported view wins when it is the further ahead of the two.
-	behind := uint64(20)
-	state.L1FinalizedTagHeight = &behind
-	state.FinalizedL1 = createL1BlockRef(60)
-	streamer.pollForFinality(ctx)
-	require.Equal(t, uint64(60), streamer.finalizedL1.Number)
-
-	// A failing L1 read is not fatal: the reported view stands.
 	state.HeaderByNumberErr = errors.New("l1 unreachable")
-	state.FinalizedL1 = createL1BlockRef(80)
 	streamer.pollForFinality(ctx)
-	require.Equal(t, uint64(80), streamer.finalizedL1.Number)
+	require.Equal(t, settled, streamer.finalizedL1.Number,
+		"an unreadable L1 leaves the view where it was")
 }
 
 func TestPollForFinalityIgnoresRegressedFinalizedL1(t *testing.T) {
@@ -979,31 +966,27 @@ func TestPollForFinalityIgnoresRegressedFinalizedL1(t *testing.T) {
 	require.Equal(t, advanced, streamer.finalizedL1)
 }
 
-// TestPollForFinalityClampsAgainstL1Head pins the fix for celo-org/optimism#483: a
-// finality reading above the L1 head is a bad response and must not latch the view.
-func TestPollForFinalityClampsAgainstL1Head(t *testing.T) {
+// TestPollForFinalityReportsTheFinalizedL2Height covers what the poll hands back to its
+// caller. pollFinality feeds the returned height to advanceOnFinalization, so it is the
+// input to pruning: it must be the finalized L2 head when there is one, and zero when
+// there is not, since pruning to a height nothing has finalized would drop batches the
+// consumer has not read.
+func TestPollForFinalityReportsTheFinalizedL2Height(t *testing.T) {
 	ctx := context.Background()
 	state, streamer := newTestStreamer(t, 42, common.Address{}, 1)
 
-	head := uint64(100)
-	state.L1HeadHeight = &head
-	state.AdvanceFinalizedL1ByNBlocks(10) // honest sync-status view at 11
+	state.AdvanceFinalizedL1ByNBlocks(10)
+	tag := uint64(40)
+	state.L1FinalizedTagHeight = &tag
+
+	// Nothing finalized on L2 yet, so report zero and let the caller prune nothing.
+	state.FinalizedL2 = eth.L2BlockRef{}
+	require.Zero(t, streamer.pollForFinality(ctx),
+		"with no finalized L2 head there is no height to prune to")
+
+	// Once there is one, it is exactly what the caller prunes to.
 	state.FinalizedL2 = createL2BlockRef(5, state.FinalizedL1)
-
-	// One poisoned finalized-tag reading, far above the head.
-	poisoned := uint64(4_000_000)
-	state.L1FinalizedTagHeight = &poisoned
-	streamer.pollForFinality(ctx)
-	require.Equal(t, uint64(11), streamer.finalizedL1.Number,
-		"a reading above the head must be discarded, not adopted")
-
-	// The next honest reading must be adopted and the poll must run to completion.
-	honest := uint64(40)
-	state.L1FinalizedTagHeight = &honest
-	finalizedL2 := streamer.pollForFinality(ctx)
-	require.Equal(t, honest, streamer.finalizedL1.Number)
-	require.NotZero(t, finalizedL2,
-		"the poll must reach the FinalizedL2 return instead of exiting at the regression guard")
+	require.Equal(t, uint64(5), streamer.pollForFinality(ctx))
 }
 
 // TestFastForwardToFallback covers the fallback position: the cursor jumps from the

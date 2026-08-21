@@ -94,10 +94,6 @@ type MockStreamerSource struct {
 	// reported by SyncStatus.
 	L1FinalizedTagHeight *uint64
 
-	// L1HeadHeight, when set, is the height HeaderByNumber reports for the latest
-	// tag, so tests can model finality readings running ahead of the head. Unset,
-	// the head answers with the highest height the mock knows.
-	L1HeadHeight *uint64
 	// HeaderByNumberErr, when set, makes every HeaderByNumber call fail.
 	HeaderByNumberErr error
 	// HeaderHashByNumberErr, when set, makes every HeaderHashByNumber call fail, so a
@@ -278,12 +274,6 @@ func (m *MockStreamerSource) HeaderByNumber(ctx context.Context, number *big.Int
 		height = number.Uint64()
 	} else if number != nil && number.Int64() == int64(rpc.FinalizedBlockNumber) && m.L1FinalizedTagHeight != nil {
 		height = *m.L1FinalizedTagHeight
-	} else if number != nil && number.Int64() == int64(rpc.LatestBlockNumber) {
-		if m.L1HeadHeight != nil {
-			height = *m.L1HeadHeight
-		} else if m.L1FinalizedTagHeight != nil && *m.L1FinalizedTagHeight > height {
-			height = *m.L1FinalizedTagHeight
-		}
 	}
 
 	return &geth_types.Header{

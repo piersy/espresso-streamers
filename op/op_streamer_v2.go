@@ -351,10 +351,25 @@ func (s *Streamer) pollForFinality(ctx context.Context) uint64 {
 		s.logger.Warn("sync status is nil")
 		return 0
 	}
-	finalizedL1 := s.getLatestFinalizedL1(ctx, syncStatus.FinalizedL1)
-	if finalizedL1 == (eth.L1BlockRef{}) {
-		s.logger.Warn("finalized L1 block is empty")
+	// L1 finality is read from the L1 client rather than the sync status, because it is
+	// the same client the origin lookups in checkBatch go to. Taking a higher number
+	// from anywhere else would let those lookups run against blocks this node has not
+	// finalized, or does not have at all.
+	header, err := s.rollupL1Client.HeaderByNumber(ctx, big.NewInt(int64(rpc.FinalizedBlockNumber)))
+	if err != nil {
+		s.logger.Warn("failed to fetch the finalized L1 header, keeping the current view", "err", err)
 		return 0
+	}
+	if header == nil || header.Number == nil {
+		s.logger.Warn("finalized L1 header is empty, keeping the current view")
+		return 0
+	}
+
+	finalizedL1 := eth.L1BlockRef{
+		Number:     header.Number.Uint64(),
+		Hash:       header.Hash(),
+		ParentHash: header.ParentHash,
+		Time:       header.Time,
 	}
 
 	s.mu.Lock()
@@ -376,49 +391,6 @@ func (s *Streamer) pollForFinality(ctx context.Context) uint64 {
 	s.confirmEspressoBlockHeight(ctx, syncStatus.FinalizedL2.L1Origin)
 
 	return syncStatus.FinalizedL2.Number
-}
-
-// getLatestFinalizedL1 returns whichever view of L1 finality is further ahead: the one the
-// sync status reports, or the L1 chain's own finalized tag.
-//
-// op-node polls that tag only every `l1.epoch-poll-interval` (384s by default), so the
-// finality it reports can trail the chain by that much on top of the epoch cadence.
-// Every batch waiting on its L1 origin to finalize pays for that delay, and asking L1
-// directly costs one call per finality poll.
-func (s *Streamer) getLatestFinalizedL1(ctx context.Context, syncStatusFinalizedL1 eth.L1BlockRef) eth.L1BlockRef {
-	header, err := s.rollupL1Client.HeaderByNumber(ctx, big.NewInt(int64(rpc.FinalizedBlockNumber)))
-	if err != nil {
-		s.logger.Warn("failed to fetch the finalized L1 header, keeping the syncStatusFinalizedL1 view",
-			"syncStatusFinalizedL1", syncStatusFinalizedL1.Number, "err", err)
-		return syncStatusFinalizedL1
-	}
-	if header == nil || header.Number == nil {
-		s.logger.Warn("finalized L1 header is empty, keeping the syncStatusFinalizedL1 view",
-			"repsyncStatusFinalizedL1orted", syncStatusFinalizedL1.Number,
-		)
-		return syncStatusFinalizedL1
-	}
-	if header.Number.Uint64() <= syncStatusFinalizedL1.Number {
-		return syncStatusFinalizedL1
-	}
-	head, headErr := s.rollupL1Client.HeaderByNumber(ctx, big.NewInt(int64(rpc.LatestBlockNumber)))
-	if headErr != nil || head == nil || head.Number == nil {
-		s.logger.Warn("ignoring the finalized tag, no L1 head to validate it against",
-			"finalizedTag", header.Number.Uint64(), "err", headErr)
-		return syncStatusFinalizedL1
-	}
-	if header.Number.Uint64() > head.Number.Uint64() {
-		s.logger.Warn("ignoring the finalized tag, finality cannot exceed the L1 head",
-			"finalizedTag", header.Number.Uint64(), "l1Head", head.Number.Uint64())
-		return syncStatusFinalizedL1
-	}
-
-	return eth.L1BlockRef{
-		Number:     header.Number.Uint64(),
-		Hash:       header.Hash(),
-		ParentHash: header.ParentHash,
-		Time:       header.Time,
-	}
 }
 
 // confirmEspressoBlockHeight pins the HotShot height that is guaranteed not to hold
