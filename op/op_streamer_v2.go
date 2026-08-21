@@ -212,18 +212,15 @@ func (s *Streamer) Stop() {
 	s.logger.Info("espresso streamer stopped")
 }
 
-// Peek returns the batch extending the tip the streamer is tracking, or nil if there
-// is none. It errors when the store holds a batch at that height which does not extend
-// the tip, since serving it would break the chain.
-func (s *Streamer) Peek() (*derivation.EspressoBatch, error) {
-	return s.store.peek()
-}
-
-// AdvancePosition records that the batch at the current position has been consumed,
-// moving the tip onto it. It errors if the store holds no such batch, or one that does
-// not extend the tip.
-func (s *Streamer) AdvancePosition() error {
-	return s.store.advance()
+// Next returns the batch extending the tip the streamer is tracking and moves the tip
+// onto it, or nil if there is none. It errors when the batch held at that position does
+// not extend the tip, since serving it would break the chain.
+//
+// The tip only ever moves forward here, and only for a batch actually handed over, so
+// no block can be skipped. A consumer that could not use the batch it received calls
+// RewindTip to be served it again - taking a batch does not drop it.
+func (s *Streamer) Next() (*derivation.EspressoBatch, error) {
+	return s.store.next()
 }
 
 // GetFallbackHotshotPos is a helper function that allows us
