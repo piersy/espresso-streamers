@@ -31,10 +31,6 @@ type batchStore struct {
 	// hash are held together so they cannot drift - the batch to serve next is always
 	// at tip.Number+1, and its parent must always be tip.Hash.
 	tip eth.BlockID
-	// lastPeeked is the batch most recently returned by peek, remembered so advance
-	// can promote exactly that batch rather than looking the position up again -
-	// advanceOnFinalization may have pruned it in the meantime.
-	lastPeeked *derivation.EspressoBatch
 
 	lastFinalizedL2 uint64
 	log             log.Logger
@@ -62,8 +58,8 @@ func (s *batchStore) insert(batch *derivation.EspressoBatch) {
 	hash := batch.Hash()
 
 	// Every log below is emitted after unlocking, deliberately: this runs once per batch
-	// off the HotShot loop, and peek takes the same write lock, so a log write held under
-	// it would stall the derivation caller.
+	// off the HotShot loop, and peek contends for the same lock, so a log write held
+	// under it would stall the derivation caller.
 	s.mu.Lock()
 
 	// Already finalized, no need to insert
@@ -105,27 +101,25 @@ func (s *batchStore) insert(batch *derivation.EspressoBatch) {
 	)
 }
 
-// peek returns the batch at the current position if it extends the tracked tip,
-// remembering it so advance can promote it without the caller naming it - hence the
-// write lock. Everything the store holds has already been validated, so there is no
-// verdict to reach here and no network call to make.
+// peek returns the batch at the current position if it extends the tracked tip.
+// Everything the store holds has already been validated, so there is no verdict to
+// reach here and no network call to make. It leaves the store untouched: advance is
+// what moves the tip on.
 func (s *batchStore) peek() *derivation.EspressoBatch {
 	// As in insert, logs are emitted after unlocking so they do not hold off the inserts
 	// coming from the HotShot loop.
-	s.mu.Lock()
-
-	s.lastPeeked = nil
+	s.mu.RLock()
 
 	next, ok := s.batches[s.nextPos()]
 	if !ok {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return nil
 	}
 	// Unreachable by construction, so fail closed rather than handing out a batch we
 	// cannot show extends the chain.
 	if s.tip.Hash == (common.Hash{}) {
 		blockNr := s.nextPos()
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		s.log.Error(
 			"tip hash unset, refusing to serve a batch",
 			"blockNr", blockNr,
@@ -136,7 +130,7 @@ func (s *batchStore) peek() *derivation.EspressoBatch {
 	// it would break the chain. Only a batcher that forked can produce this.
 	if next.BatchHeader.ParentHash != s.tip.Hash {
 		blockNr, currentTip, parent := s.nextPos(), s.tip, next.BatchHeader.ParentHash
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		s.log.Warn(
 			"held batch does not extend the tip",
 			"blockNr", blockNr,
@@ -146,8 +140,7 @@ func (s *batchStore) peek() *derivation.EspressoBatch {
 		return nil
 	}
 
-	s.lastPeeked = next
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	return next
 }
 
@@ -167,34 +160,26 @@ func (s *batchStore) tipRef() eth.BlockID {
 	return s.tip
 }
 
-// advance records that the batch last returned by peek has been consumed: it
-// becomes the tip, so the next peek looks for its child. Without a peeked batch it
-// is a no-op: advancing only the position would wedge peek permanently (#485).
-func (s *batchStore) advance() {
+// advance records that the batch at the current position has been consumed: it becomes
+// the tip, so the next peek looks for its child. With no batch held there it reports an
+// error and leaves the tip alone, since moving the position past a batch the store does
+// not have would wedge peek permanently (#485).
+func (s *batchStore) advance() error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.batches[s.nextPos()]
 
-	if s.lastPeeked == nil {
-		blockNr, currentTip := s.nextPos(), s.tip
-		s.mu.Unlock()
-		s.log.Warn(
-			"advance without a peeked batch, refusing to move the position",
-			"blockNr", blockNr,
-			"tip", currentTip,
-		)
-		return
+	if current == nil {
+		return fmt.Errorf("no batch for block number %d, cannot advance", s.nextPos())
 	}
-	s.tip = eth.BlockID{Hash: s.lastPeeked.BatchHeader.Hash(), Number: s.lastPeeked.Number()}
-	s.lastPeeked = nil
-	s.mu.Unlock()
+	s.tip = eth.BlockID{Hash: current.BatchHeader.Hash(), Number: current.Number()}
+	return nil
 }
 
 // rewindTip moves the tip back to an earlier block, so the consumer can re-read the
 // batches from there onwards. Rewinding only: the tip otherwise moves solely when the
 // consumer reads a batch, so moving it forward here would skip batches the consumer
 // never saw.
-//
-// Any peeked batch is withdrawn, since it sits at the old position and promoting it
-// afterwards would undo the rewind.
 func (s *batchStore) rewindTip(tip eth.BlockID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -208,7 +193,6 @@ func (s *batchStore) rewindTip(tip eth.BlockID) error {
 		return fmt.Errorf("rewindTip requires a tip hash, got the zero hash at height %d", tip.Number)
 	}
 	s.tip = tip
-	s.lastPeeked = nil
 	return nil
 }
 

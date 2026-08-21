@@ -523,41 +523,6 @@ func TestRewindTipRejectsZeroHash(t *testing.T) {
 	require.Equal(t, before, streamer.store.tipRef())
 }
 
-// TestRewindTipWithdrawsPeekedBatch covers the handoff: the peeked batch sits at the
-// old position, so promoting it after a rewind would undo the rewind.
-func TestRewindTipWithdrawsPeekedBatch(t *testing.T) {
-	const origin = uint64(5)
-	state, streamer := newTestStreamer(t, 42, common.Address{}, origin)
-
-	acceptedBatch(t, streamer, origin+1, createHashFromHeight(origin))
-	require.NotNil(t, streamer.Peek(), "batch is handed out")
-
-	target := createL2BlockRef(origin-2, state.FinalizedL1).ID()
-	require.NoError(t, streamer.RewindTip(target))
-
-	// If lastPeeked was set AdvancePosition would make the tip the subsequent block. So the fact
-	// that the tip equals the target means that lastPeeked was not set during AdvancePosition.
-	streamer.AdvancePosition()
-	require.Equal(t, target, streamer.store.tipRef(),
-		"a batch peeked before the rewind must not become the tip afterwards")
-}
-
-// TestRewindTipRejectionKeepsPeekedBatch is the other side of it: a rewind that was
-// refused changed nothing, so the pending peek/advance handoff still completes.
-func TestRewindTipRejectionKeepsPeekedBatch(t *testing.T) {
-	const origin = uint64(1)
-	state, streamer := newTestStreamer(t, 42, common.Address{}, origin)
-
-	first := acceptedBatch(t, streamer, origin+1, createHashFromHeight(origin))
-	require.Equal(t, first.Hash(), streamer.Peek().Hash())
-
-	require.Error(t, streamer.RewindTip(createL2BlockRef(origin+3, state.FinalizedL1).ID()))
-
-	streamer.AdvancePosition()
-	require.Equal(t, eth.BlockID{Hash: first.BatchHeader.Hash(), Number: first.Number()},
-		streamer.store.tipRef(), "a refused rewind must not break the peek/advance handoff")
-}
-
 // TestStorePrunesConsumedAndFinalized covers the prune boundary: a batch is dropped
 // only once it is both finalized and behind the tip, so the consumer has read it.
 func TestStorePrunesConsumedAndFinalized(t *testing.T) {
@@ -594,7 +559,7 @@ func TestStoreKeepsUnconsumedPastFinality(t *testing.T) {
 	require.Equal(t, first.Hash(), streamer.Peek().Hash(), "and must still be servable")
 }
 
-func TestStoreAdvanceWithoutPeekIsANoOp(t *testing.T) {
+func TestStoreAdvanceWithoutBatchIsANoOp(t *testing.T) {
 	const origin = uint64(3)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 	before := streamer.store.tipRef()
@@ -602,35 +567,16 @@ func TestStoreAdvanceWithoutPeekIsANoOp(t *testing.T) {
 	streamer.AdvancePosition()
 
 	require.Equal(t, before, streamer.store.tipRef(),
-		"the tip only moves for a batch that was handed out: moving the position without it wedges peek permanently")
+		"the tip only moves for a batch the store holds: moving the position without one wedges peek permanently")
 }
 
-// TestAdvanceAfterWithheldPeekDoesNotMoveTip pins the Peek/AdvancePosition handoff: a
-// batch Peek withheld must not become the tip if the consumer advances anyway, which
-// would adopt a block nobody derived.
-func TestAdvanceAfterWithheldPeekDoesNotMoveTip(t *testing.T) {
-	const origin = uint64(1)
-	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
-
-	// Held, but on another fork, so Peek withholds it.
-	streamer.store.insert(chainedBatch(origin+1, common.HexToHash("0xotherfork"), common.Address{}, 1))
-
-	before := streamer.store.tipRef()
-	require.Nil(t, streamer.Peek(), "a batch off the tip must not be served")
-
-	streamer.AdvancePosition()
-
-	require.Equal(t, before, streamer.store.tipRef(),
-		"a withheld batch must not become the tip, nor move the position")
-}
-
-// TestAdvanceWithoutPeekLeavesStoreRecoverable pins the no-op: a spurious
+// TestAdvanceWithoutBatchLeavesStoreRecoverable pins the no-op: a spurious
 // AdvancePosition must not wedge the store (#485).
-func TestAdvanceWithoutPeekLeavesStoreRecoverable(t *testing.T) {
+func TestAdvanceWithoutBatchLeavesStoreRecoverable(t *testing.T) {
 	const origin = uint64(1)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 
-	streamer.AdvancePosition() // nothing was peeked
+	streamer.AdvancePosition() // nothing held at the next position
 
 	batch := chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, 1)
 	streamer.store.insert(batch)
