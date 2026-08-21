@@ -1,6 +1,7 @@
 package op
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/EspressoSystems/espresso-streamers/op/derivation"
@@ -187,37 +188,52 @@ func (s *batchStore) advance() {
 	s.mu.Unlock()
 }
 
-// setTip repositions the store onto the tip the caller knows to be canonical,
-// dropping whatever it was tracking.
-func (s *batchStore) setTip(tip eth.BlockID) {
+// rewindTip moves the tip back to an earlier block, so the consumer can re-read the
+// batches from there onwards. Rewinding only: the tip otherwise moves solely when the
+// consumer reads a batch, so moving it forward here would skip batches the consumer
+// never saw.
+//
+// Any peeked batch is withdrawn, since it sits at the old position and promoting it
+// afterwards would undo the rewind.
+func (s *batchStore) rewindTip(tip eth.BlockID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if tip.Number > s.tip.Number {
+		return fmt.Errorf("rewindTip requires target(%d) <= current(%d)", tip.Number, s.tip.Number)
+	}
+	// peek fails closed on a zero tip hash, so taking one here would stall the store
+	// rather than report the bad argument to the caller.
+	if tip.Hash == (common.Hash{}) {
+		return fmt.Errorf("rewindTip requires a tip hash, got the zero hash at height %d", tip.Number)
+	}
 	s.tip = tip
 	s.lastPeeked = nil
+	return nil
 }
 
 func (s *batchStore) advanceOnFinalization(finalizedL2 uint64) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if finalizedL2 <= s.lastFinalizedL2 {
-		s.mu.Unlock()
 		return
 	}
+	s.lastFinalizedL2 = finalizedL2
 
-	// Ranging over the heights held, not every number up to finalizedL2: the first call
-	// after startup would otherwise iterate the whole chain under the write lock.
+	// We want to avoid deleting entries past the tip, because they have not yet been read by the
+	// consumer. hotShotPos never rewinds, so a deleted batch can never be read again.
+	end := min(s.tip.Number, finalizedL2)
 	for height := range s.batches {
-		if height <= finalizedL2 {
+		if height <= end {
 			delete(s.batches, height)
 		}
 	}
-	s.lastFinalizedL2 = finalizedL2
-	nextBatchPos, remaining := s.nextPos(), len(s.batches)
-	s.mu.Unlock()
 
 	s.log.Info(
 		"pruned finalized slots",
 		"finalizedL2", finalizedL2,
-		"nextBatchPos", nextBatchPos,
-		"batches", remaining,
+		"prunedTo", end,
+		"remaining batches", len(s.batches),
 	)
 }

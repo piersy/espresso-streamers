@@ -234,16 +234,18 @@ func (s *Streamer) UnmarshalBatch(b []byte, l1Finalized uint64) (*derivation.Esp
 	return s.unmarshal(b, l1Finalized)
 }
 
-// SetTip resets the streamers tip to the given l2Head, so the next batch it serves is
-// that block's child. This allows re-reading batches from the tip onwards. This is required in the
-// case of a batcher channel reset.
-func (s *Streamer) SetTip(l2Head eth.L2BlockRef) {
-	if l2Head == (eth.L2BlockRef{}) {
-		s.logger.Warn("ignoring tip position with empty L2 head", "tip", s.store.tipRef())
-		return
-	}
-	s.logger.Info("setting streamer tip position", "l2Nr", l2Head.Number, "l2Hash", l2Head.Hash.Hex())
-	s.store.setTip(l2Head.ID())
+// RewindTip rewinds the streamer's tip to the given point, so the next batch it serves is that
+// block's child. This allows re-reading batches from the tip onwards, which is required in the
+// case of a batcher channel reset. It fails if the given point is ahead of the current tip, since
+// the tip otherwise advances only as the consumer reads.
+//
+// There is a potential edge case where the requested tip could already have been pruned, which
+// would happen if the streamer's finality view advanced past the batcher's safe head view
+// (batcher channel resets rewind to the safe head). As long as the streamer and the batcher take
+// finality from the same source this should be mitigated, since the finalized head trails the
+// safe head by ~12 minutes and both poll far more often than that.
+func (s *Streamer) RewindTip(tip eth.BlockID) error {
+	return s.store.rewindTip(tip)
 }
 
 // pollFinality keeps the streamer's view of finality current, on an interval. It is

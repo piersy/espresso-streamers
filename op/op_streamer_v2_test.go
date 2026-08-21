@@ -430,13 +430,15 @@ func storedAt(s *Streamer, l2Number uint64) *derivation.EspressoBatch {
 	return s.store.batches[l2Number]
 }
 
-// storeHasStale reports whether the store still holds a batch at or below the height it
-// believes is finalized.
+// storeHasStale reports whether the store still holds a batch at or below its prune
+// boundary. That is the lower of the finalized height and the tip: batches above the
+// tip are unread, so they survive finality by design.
 func storeHasStale(s *Streamer) bool {
 	s.store.mu.RLock()
 	defer s.store.mu.RUnlock()
+	boundary := min(s.store.lastFinalizedL2, s.store.tip.Number)
 	for height := range s.store.batches {
-		if height <= s.store.lastFinalizedL2 {
+		if height <= boundary {
 			return true
 		}
 	}
@@ -475,53 +477,121 @@ func TestStorePeekFailsClosedOnUnsetTip(t *testing.T) {
 	require.Nil(t, streamer.Peek())
 }
 
-// TestSetBatchPositionRepositionsAndRetargetsTip covers both heads a caller can anchor
-// to: the streamer takes whichever L2 block it is handed, rather than reaching into a
-// sync status for one of them itself.
-func TestSetBatchPositionRepositionsAndRetargetsTip(t *testing.T) {
-	const origin = uint64(1)
-	state, streamer := newTestStreamer(t, 42, common.Address{}, origin)
-
-	state.AdvanceL2ByNBlocks(5)
-	state.FinalizedL2 = createL2BlockRef(2, state.FinalizedL1)
-	syncStatus := state.SyncStatus()
+// TestRewindTipOnlyMovesBackwards pins the direction rule: the tip otherwise advances
+// only as the consumer reads, so moving it forward here would skip batches the consumer
+// never saw. Staying put is allowed, since re-reading from the current tip is a valid
+// reset.
+func TestRewindTipOnlyMovesBackwards(t *testing.T) {
+	const origin = uint64(5)
 
 	for _, tc := range []struct {
-		name string
-		head eth.L2BlockRef
+		name     string
+		target   uint64
+		accepted bool
 	}{
-		{"safe L2 head", syncStatus.SafeL2},
-		{"finalized L2 head", syncStatus.FinalizedL2},
+		{"backwards", origin - 1, true},
+		{"to the current tip", origin, true},
+		{"forwards", origin + 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			streamer.SetTip(tc.head)
+			state, streamer := newTestStreamer(t, 42, common.Address{}, origin)
+			before := streamer.store.tipRef()
 
-			require.Equal(t, tc.head.ID(), streamer.store.tipRef())
+			target := createL2BlockRef(tc.target, state.FinalizedL1).ID()
+			err := streamer.RewindTip(target)
+
+			if tc.accepted {
+				require.NoError(t, err)
+				require.Equal(t, target, streamer.store.tipRef())
+				return
+			}
+			require.Error(t, err, "a forward move must be reported, not silently applied")
+			require.Equal(t, before, streamer.store.tipRef(), "and must leave the tip alone")
 		})
 	}
 }
 
-func TestSetBatchPositionIgnoresEmptyHead(t *testing.T) {
-	const origin = uint64(3)
+// TestRewindTipRejectsZeroHash covers the argument peek cannot work with: it fails
+// closed on a zero tip hash, so accepting one would stall the store instead of telling
+// the caller its reset was bad.
+func TestRewindTipRejectsZeroHash(t *testing.T) {
+	const origin = uint64(5)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 	before := streamer.store.tipRef()
 
-	streamer.SetTip(eth.L2BlockRef{})
-	require.Equal(t, before, streamer.store.tipRef(),
-		"an empty L2 head must not zero the tip, nor move the position to 1")
+	require.Error(t, streamer.RewindTip(eth.BlockID{Number: origin - 1}))
+	require.Equal(t, before, streamer.store.tipRef())
 }
 
-func TestStorePrunesFinalizedAndLeavesNoStale(t *testing.T) {
+// TestRewindTipWithdrawsPeekedBatch covers the handoff: the peeked batch sits at the
+// old position, so promoting it after a rewind would undo the rewind.
+func TestRewindTipWithdrawsPeekedBatch(t *testing.T) {
+	const origin = uint64(5)
+	state, streamer := newTestStreamer(t, 42, common.Address{}, origin)
+
+	acceptedBatch(t, streamer, origin+1, createHashFromHeight(origin))
+	require.NotNil(t, streamer.Peek(), "batch is handed out")
+
+	target := createL2BlockRef(origin-2, state.FinalizedL1).ID()
+	require.NoError(t, streamer.RewindTip(target))
+
+	// If lastPeeked was set AdvancePosition would make the tip the subsequent block. So the fact
+	// that the tip equals the target means that lastPeeked was not set during AdvancePosition.
+	streamer.AdvancePosition()
+	require.Equal(t, target, streamer.store.tipRef(),
+		"a batch peeked before the rewind must not become the tip afterwards")
+}
+
+// TestRewindTipRejectionKeepsPeekedBatch is the other side of it: a rewind that was
+// refused changed nothing, so the pending peek/advance handoff still completes.
+func TestRewindTipRejectionKeepsPeekedBatch(t *testing.T) {
+	const origin = uint64(1)
+	state, streamer := newTestStreamer(t, 42, common.Address{}, origin)
+
+	first := acceptedBatch(t, streamer, origin+1, createHashFromHeight(origin))
+	require.Equal(t, first.Hash(), streamer.Peek().Hash())
+
+	require.Error(t, streamer.RewindTip(createL2BlockRef(origin+3, state.FinalizedL1).ID()))
+
+	streamer.AdvancePosition()
+	require.Equal(t, eth.BlockID{Hash: first.BatchHeader.Hash(), Number: first.Number()},
+		streamer.store.tipRef(), "a refused rewind must not break the peek/advance handoff")
+}
+
+// TestStorePrunesConsumedAndFinalized covers the prune boundary: a batch is dropped
+// only once it is both finalized and behind the tip, so the consumer has read it.
+func TestStorePrunesConsumedAndFinalized(t *testing.T) {
 	const origin = uint64(1)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 
 	first := acceptedBatch(t, streamer, origin+1, createHashFromHeight(origin))
 	acceptedBatch(t, streamer, origin+2, first.BatchHeader.Hash())
 
+	// Consume the first, so the tip reaches it and finality may prune it.
+	require.Equal(t, first.Hash(), streamer.Peek().Hash())
+	streamer.AdvancePosition()
+
 	streamer.store.advanceOnFinalization(origin + 1)
 
-	require.Equal(t, 1, storeTotal(streamer), "the finalized slot should be gone")
-	require.False(t, storeHasStale(streamer), "nothing may survive at or below the finalized height")
+	require.Nil(t, storedAt(streamer, origin+1), "the consumed, finalized batch should be gone")
+	require.Equal(t, 1, storeTotal(streamer))
+	require.False(t, storeHasStale(streamer), "nothing may survive at or below the prune boundary")
+}
+
+// TestStoreKeepsUnconsumedPastFinality pins the clamp: finality overtaking a batch the
+// consumer has not read must not delete it. hotShotPos never rewinds, so a pruned batch
+// can never be re-read and peek would stall for good.
+func TestStoreKeepsUnconsumedPastFinality(t *testing.T) {
+	const origin = uint64(1)
+	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
+
+	first := acceptedBatch(t, streamer, origin+1, createHashFromHeight(origin))
+
+	// Finality runs past the batch while it is still sitting at the next position.
+	streamer.store.advanceOnFinalization(origin + 5)
+
+	require.NotNil(t, storedAt(streamer, origin+1), "an unread batch must survive finality")
+	require.Equal(t, first.Hash(), streamer.Peek().Hash(), "and must still be servable")
 }
 
 func TestStoreAdvanceWithoutPeekIsANoOp(t *testing.T) {
