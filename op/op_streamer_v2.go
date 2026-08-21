@@ -212,14 +212,18 @@ func (s *Streamer) Stop() {
 	s.logger.Info("espresso streamer stopped")
 }
 
-// Peek returns the batch extending the tip the streamer is tracking, or nil if
-// there is none.
-func (s *Streamer) Peek() *derivation.EspressoBatch {
+// Peek returns the batch extending the tip the streamer is tracking, or nil if there
+// is none. It errors when the store holds a batch at that height which does not extend
+// the tip, since serving it would break the chain.
+func (s *Streamer) Peek() (*derivation.EspressoBatch, error) {
 	return s.store.peek()
 }
 
-func (s *Streamer) AdvancePosition() {
-	s.store.advance()
+// AdvancePosition records that the batch at the current position has been consumed,
+// moving the tip onto it. It errors if the store holds no such batch, or one that does
+// not extend the tip.
+func (s *Streamer) AdvancePosition() error {
+	return s.store.advance()
 }
 
 // GetFallbackHotshotPos is a helper function that allows us
@@ -658,6 +662,9 @@ func (s *Streamer) process(ctx context.Context, hotShotHeight uint64, l1Finalize
 // declares an L1 origin we have not finalized, so its hash cannot be compared yet.
 // That is not a failure: the caller leaves the batch where it is and reads it again
 // once finality has moved. Any other error is a failed L1 lookup.
+//
+// Since espresso can confirm batches out of order, the parent hash linkage cannot be
+// checked here, instead it is checked when each batch is consumed.
 func (s *Streamer) checkBatch(ctx context.Context, batch *derivation.EspressoBatch) (BatchValidity, error) {
 	// A batch at or below the finalized L2 head has already been derived, so there is
 	// nothing to do with it.

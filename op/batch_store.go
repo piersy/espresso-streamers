@@ -50,6 +50,26 @@ func (s *batchStore) nextPos() uint64 {
 	return s.tip.Number + 1
 }
 
+// Returns the next batch ensuring that it's parent hash links to the stored parent block, otherwise
+// an error is returned. In the case that no next batch is present a nil batch is returned.
+//
+// It is required that the mutex be held before calling this function.
+func (s *batchStore) nextBatch() (*derivation.EspressoBatch, error) {
+	n := s.batches[s.nextPos()]
+	if n == nil {
+		return nil, nil
+	}
+	if n.BatchHeader.ParentHash != s.tip.Hash {
+		return nil, fmt.Errorf(
+			"next batch does not extend the tip, blockNum: %d, tipHash: %v, parentHash: %v",
+			s.nextPos(),
+			s.tip.Hash,
+			n.BatchHeader.ParentHash,
+		)
+	}
+	return n, nil
+}
+
 // insert records a validated batch at its height. The first batch to claim a height
 // keeps it; see the type comment for why a later one is the batcher equivocating.
 func (s *batchStore) insert(batch *derivation.EspressoBatch) {
@@ -105,43 +125,10 @@ func (s *batchStore) insert(batch *derivation.EspressoBatch) {
 // Everything the store holds has already been validated, so there is no verdict to
 // reach here and no network call to make. It leaves the store untouched: advance is
 // what moves the tip on.
-func (s *batchStore) peek() *derivation.EspressoBatch {
-	// As in insert, logs are emitted after unlocking so they do not hold off the inserts
-	// coming from the HotShot loop.
+func (s *batchStore) peek() (*derivation.EspressoBatch, error) {
 	s.mu.RLock()
-
-	next, ok := s.batches[s.nextPos()]
-	if !ok {
-		s.mu.RUnlock()
-		return nil
-	}
-	// Unreachable by construction, so fail closed rather than handing out a batch we
-	// cannot show extends the chain.
-	if s.tip.Hash == (common.Hash{}) {
-		blockNr := s.nextPos()
-		s.mu.RUnlock()
-		s.log.Error(
-			"tip hash unset, refusing to serve a batch",
-			"blockNr", blockNr,
-		)
-		return nil
-	}
-	// The batch is valid in itself but builds on a block we did not serve, so serving
-	// it would break the chain. Only a batcher that forked can produce this.
-	if next.BatchHeader.ParentHash != s.tip.Hash {
-		blockNr, currentTip, parent := s.nextPos(), s.tip, next.BatchHeader.ParentHash
-		s.mu.RUnlock()
-		s.log.Warn(
-			"held batch does not extend the tip",
-			"blockNr", blockNr,
-			"tip", currentTip,
-			"parentHash", parent,
-		)
-		return nil
-	}
-
-	s.mu.RUnlock()
-	return next
+	defer s.mu.RUnlock()
+	return s.nextBatch()
 }
 
 // finalizedL2 returns the highest L2 block number known to be finalized. Batches at
@@ -167,8 +154,10 @@ func (s *batchStore) tipRef() eth.BlockID {
 func (s *batchStore) advance() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	current := s.batches[s.nextPos()]
-
+	current, err := s.nextBatch()
+	if err != nil {
+		return fmt.Errorf("cannot advance: %w", err)
+	}
 	if current == nil {
 		return fmt.Errorf("no batch for block number %d, cannot advance", s.nextPos())
 	}

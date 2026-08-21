@@ -332,7 +332,7 @@ func TestCheckBatchPastAtOrBelowFinalizedL2(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// Store: tip tracking, competing candidates, pruning
+// Store: tip tracking, one batch per height, pruning
 // -----------------------------------------------------------------------------
 
 // acceptedBatch stores a batch directly, as the fetch loop does once it has validated
@@ -344,9 +344,25 @@ func acceptedBatch(t *testing.T, s *Streamer, l2Number uint64, parentHash common
 	return b
 }
 
+// mustPeek returns the batch the streamer serves, failing the test if peek reports the
+// held batch does not extend the tip. Use Peek directly where that error is the point.
+func mustPeek(t *testing.T, s *Streamer) *derivation.EspressoBatch {
+	t.Helper()
+	b, err := s.Peek()
+	require.NoError(t, err)
+	return b
+}
+
+// mustAdvance consumes the batch at the current position, failing the test if there is
+// none or it does not extend the tip.
+func mustAdvance(t *testing.T, s *Streamer) {
+	t.Helper()
+	require.NoError(t, s.AdvancePosition())
+}
+
 func TestPeekEmptyStore(t *testing.T) {
 	_, streamer := newTestStreamer(t, 42, common.Address{}, 1)
-	require.Nil(t, streamer.Peek())
+	require.Nil(t, mustPeek(t, streamer))
 }
 
 func TestStoreServesBatchesInOrderAndAdvancesTip(t *testing.T) {
@@ -356,15 +372,15 @@ func TestStoreServesBatchesInOrderAndAdvancesTip(t *testing.T) {
 	first := acceptedBatch(t, streamer, origin+1, createHashFromHeight(origin))
 	second := acceptedBatch(t, streamer, origin+2, first.BatchHeader.Hash())
 
-	require.Equal(t, first.Hash(), streamer.Peek().Hash())
-	streamer.AdvancePosition()
+	require.Equal(t, first.Hash(), mustPeek(t, streamer).Hash())
+	mustAdvance(t, streamer)
 	require.Equal(t, eth.BlockID{Hash: first.BatchHeader.Hash(), Number: first.Number()},
 		streamer.store.tipRef(), "consumed batch becomes the tip")
 
-	require.Equal(t, second.Hash(), streamer.Peek().Hash())
-	streamer.AdvancePosition()
+	require.Equal(t, second.Hash(), mustPeek(t, streamer).Hash())
+	mustAdvance(t, streamer)
 
-	require.Nil(t, streamer.Peek(), "nothing left to serve")
+	require.Nil(t, mustPeek(t, streamer), "nothing left to serve")
 }
 
 // TestStoreKeepsFirstBatchAtAHeight pins the one-batch-per-height rule. Only validated
@@ -385,7 +401,7 @@ func TestStoreKeepsFirstBatchAtAHeight(t *testing.T) {
 
 	require.Equal(t, 1, storeTotal(streamer), "a height holds one batch")
 	require.Equal(t, first.Hash(), storedAt(streamer, origin+1).Hash(), "the first one keeps the height")
-	require.Equal(t, first.Hash(), streamer.Peek().Hash())
+	require.Equal(t, first.Hash(), mustPeek(t, streamer).Hash())
 }
 
 func TestStoreIgnoresDuplicateBatchHash(t *testing.T) {
@@ -403,17 +419,18 @@ func TestStoreIgnoresDuplicateBatchHash(t *testing.T) {
 	require.Equal(t, 1, storeTotal(streamer), "an identical batch must not be stored twice")
 }
 
-// TestStorePeekWithholdsBatchNotExtendingTip covers the parent-hash guard that survives
-// the move to one batch per height: the batch is valid in itself but builds on a block
-// the streamer did not serve, so serving it would break the chain.
+// TestStorePeekWithholdsBatchNotExtendingTip covers the parent-hash guard: the batch is
+// valid in itself but builds on a block the streamer did not serve, so serving it would
+// break the chain. Only a batcher that forked can produce this.
 func TestStorePeekWithholdsBatchNotExtendingTip(t *testing.T) {
 	const origin = uint64(1)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 
 	streamer.store.insert(chainedBatch(origin+1, common.HexToHash("0xotherfork"), common.Address{}, 1))
 
-	require.Nil(t, streamer.Peek(),
-		"a batch whose parent is not the tip must not be served")
+	got, err := streamer.Peek()
+	require.Error(t, err, "a batch whose parent is not the tip must not be served")
+	require.Nil(t, got)
 }
 
 // storeTotal reads the store's batch count under its lock.
@@ -454,27 +471,56 @@ func TestStoreOutOfOrderInsertsServedInOrder(t *testing.T) {
 	second := chainedBatch(origin+2, first.BatchHeader.Hash(), common.Address{}, 1)
 
 	streamer.store.insert(second)
-	require.Nil(t, streamer.Peek(), "the later batch must not be served early")
+	require.Nil(t, mustPeek(t, streamer), "the later batch must not be served early")
 
 	streamer.store.insert(first)
-	require.Equal(t, first.Hash(), streamer.Peek().Hash())
-	streamer.AdvancePosition()
-	require.Equal(t, second.Hash(), streamer.Peek().Hash())
+	require.Equal(t, first.Hash(), mustPeek(t, streamer).Hash())
+	mustAdvance(t, streamer)
+	require.Equal(t, second.Hash(), mustPeek(t, streamer).Hash())
 }
 
-func TestStorePeekFailsClosedOnUnsetTip(t *testing.T) {
+// TestStoreAdvanceRefusesBatchNotExtendingTip is the other half of the guard peek and
+// advance share: a batch peek refuses to serve must not become the tip either, or a
+// consumer that advances regardless would adopt a block that breaks the chain.
+func TestStoreAdvanceRefusesBatchNotExtendingTip(t *testing.T) {
+	const origin = uint64(1)
+	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
+	before := streamer.store.tipRef()
+
+	streamer.store.insert(chainedBatch(origin+1, common.HexToHash("0xotherfork"), common.Address{}, 1))
+
+	require.Error(t, streamer.AdvancePosition())
+	require.Equal(t, before, streamer.store.tipRef(),
+		"a batch that does not extend the tip must not become the tip")
+}
+
+// TestStoreInsertIgnoresFinalizedHeight covers the guard that makes a pruned batch
+// unrecoverable: once finality has passed a height, a batch for it is not taken back in.
+func TestStoreInsertIgnoresFinalizedHeight(t *testing.T) {
 	const origin = uint64(1)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 
-	acceptedBatch(t, streamer, origin+1, createHashFromHeight(origin))
+	streamer.store.advanceOnFinalization(origin + 5)
+	streamer.store.insert(chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, 1))
 
-	// Forcing the invariant violation: an unset tip must serve nothing rather than
-	// pick a fork by map iteration order.
-	streamer.store.mu.Lock()
-	streamer.store.tip.Hash = common.Hash{}
-	streamer.store.mu.Unlock()
+	require.Zero(t, storeTotal(streamer),
+		"a batch at or below the finalized height must not be stored")
+}
 
-	require.Nil(t, streamer.Peek())
+// TestStorePruneIgnoresNonAdvancingFinality covers the monotonicity guard: finality only
+// moves forward, so a repeated or regressed height must not lower what the store holds.
+func TestStorePruneIgnoresNonAdvancingFinality(t *testing.T) {
+	const origin = uint64(1)
+	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
+
+	streamer.store.advanceOnFinalization(10)
+	require.Equal(t, uint64(10), streamer.store.finalizedL2())
+
+	streamer.store.advanceOnFinalization(4)
+	require.Equal(t, uint64(10), streamer.store.finalizedL2(), "finality must not regress")
+
+	streamer.store.advanceOnFinalization(10)
+	require.Equal(t, uint64(10), streamer.store.finalizedL2(), "nor be lowered by a repeat")
 }
 
 // TestRewindTipOnlyMovesBackwards pins the direction rule: the tip otherwise advances
@@ -533,8 +579,8 @@ func TestStorePrunesConsumedAndFinalized(t *testing.T) {
 	acceptedBatch(t, streamer, origin+2, first.BatchHeader.Hash())
 
 	// Consume the first, so the tip reaches it and finality may prune it.
-	require.Equal(t, first.Hash(), streamer.Peek().Hash())
-	streamer.AdvancePosition()
+	require.Equal(t, first.Hash(), mustPeek(t, streamer).Hash())
+	mustAdvance(t, streamer)
 
 	streamer.store.advanceOnFinalization(origin + 1)
 
@@ -556,32 +602,35 @@ func TestStoreKeepsUnconsumedPastFinality(t *testing.T) {
 	streamer.store.advanceOnFinalization(origin + 5)
 
 	require.NotNil(t, storedAt(streamer, origin+1), "an unread batch must survive finality")
-	require.Equal(t, first.Hash(), streamer.Peek().Hash(), "and must still be servable")
+	require.Equal(t, first.Hash(), mustPeek(t, streamer).Hash(), "and must still be servable")
 }
 
-func TestStoreAdvanceWithoutBatchIsANoOp(t *testing.T) {
+// TestStoreAdvanceWithoutBatchErrors pins the refusal: advancing the position past a
+// batch the store does not have would wedge peek permanently (#485), so it reports
+// instead and leaves the tip where it was.
+func TestStoreAdvanceWithoutBatchErrors(t *testing.T) {
 	const origin = uint64(3)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 	before := streamer.store.tipRef()
 
-	streamer.AdvancePosition()
+	require.Error(t, streamer.AdvancePosition())
 
 	require.Equal(t, before, streamer.store.tipRef(),
 		"the tip only moves for a batch the store holds: moving the position without one wedges peek permanently")
 }
 
-// TestAdvanceWithoutBatchLeavesStoreRecoverable pins the no-op: a spurious
-// AdvancePosition must not wedge the store (#485).
+// TestAdvanceWithoutBatchLeavesStoreRecoverable is the follow-on: having refused, the
+// store still serves the batch normally once it arrives (#485).
 func TestAdvanceWithoutBatchLeavesStoreRecoverable(t *testing.T) {
 	const origin = uint64(1)
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 
-	streamer.AdvancePosition() // nothing held at the next position
+	require.Error(t, streamer.AdvancePosition(), "nothing held at the next position")
 
 	batch := chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, 1)
 	streamer.store.insert(batch)
 
-	got := streamer.Peek()
+	got := mustPeek(t, streamer)
 	require.NotNil(t, got, "a stale advance must leave the store recoverable")
 	require.Equal(t, origin+1, got.Number())
 }
@@ -615,7 +664,7 @@ func TestFetchStoresAndServesSignedBatch(t *testing.T) {
 	_, err = streamer.fetchEspressoTransactions(ctx)
 	require.NoError(t, err)
 
-	got := streamer.Peek()
+	got := mustPeek(t, streamer)
 	require.NotNil(t, got, "the signed batch should have been stored and accepted")
 	require.Equal(t, batch.Number(), got.Number())
 	require.Equal(t, signerAddress, got.SignerAddress, "signer is recovered from the signature")
@@ -647,7 +696,7 @@ func TestFetchDropsForeignSignedBatch(t *testing.T) {
 	_, err = streamer.fetchEspressoTransactions(ctx)
 	require.NoError(t, err)
 
-	require.Nil(t, streamer.Peek(), "a batch signed by an unauthorized key must be dropped")
+	require.Nil(t, mustPeek(t, streamer), "a batch signed by an unauthorized key must be dropped")
 	require.Zero(t, storeTotal(streamer), "it must not even be stored")
 }
 
@@ -708,7 +757,7 @@ func TestFetchDefersBlockWhoseAnchorIsNotFinalizedLocally(t *testing.T) {
 	_, err = streamer.fetchEspressoTransactions(ctx)
 	require.NoError(t, err)
 
-	got := streamer.Peek()
+	got := mustPeek(t, streamer)
 	require.NotNil(t, got, "the deferred batch must be picked up once finality catches up")
 	require.Equal(t, batch.Number(), got.Number())
 }
@@ -739,7 +788,7 @@ func TestFetchDefersBatchWhoseOriginIsNotFinalized(t *testing.T) {
 	_, err = streamer.fetchEspressoTransactions(ctx)
 	require.NoError(t, err)
 
-	got := streamer.Peek()
+	got := mustPeek(t, streamer)
 	require.NotNil(t, got, "the batch resolves once its origin finalizes")
 	require.Equal(t, origin+1, got.Number())
 }
@@ -827,7 +876,7 @@ func TestFetchProcessesUpToTheDeferralPoint(t *testing.T) {
 	require.Equal(t, uint64(1), streamer.hotShotPos, "the cursor stops at the block it could not judge")
 	require.Equal(t, 1, storeTotal(streamer), "only the block it could judge was stored")
 
-	got := streamer.Peek()
+	got := mustPeek(t, streamer)
 	require.NotNil(t, got)
 	require.Equal(t, first.Number(), got.Number())
 }
