@@ -42,7 +42,6 @@ func newTestStreamer(t *testing.T, namespace uint64, batcher common.Address, ori
 		state,
 		batchAuthenticatorAddr,
 		namespace,
-		derivation.CreateEspressoBatchUnmarshaler(),
 		func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil },
 		time.Second,
 		50*time.Millisecond,
@@ -96,7 +95,7 @@ func TestNewStreamerValidation(t *testing.T) {
 		p func(context.Context) (*eth.SyncStatus, error), interval time.Duration) error {
 		_, err := NewStreamer(
 			context.Background(), state, state, l2, lc, authAddr, 1,
-			derivation.CreateEspressoBatchUnmarshaler(), p, interval, time.Second, new(NoOpLogger), 0, 1,
+			p, interval, time.Second, new(NoOpLogger), 0, 1,
 		)
 		return err
 	}
@@ -1071,7 +1070,6 @@ func TestFallbackHotshotPosStartsAtStreamerOrigin(t *testing.T) {
 	state := NewMockStreamerSource()
 	streamer, err := NewStreamer(
 		context.Background(), state, state, state, state, batchAuthenticatorAddr, 42,
-		derivation.CreateEspressoBatchUnmarshaler(),
 		func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil },
 		time.Second, time.Second, new(NoOpLogger), originHotShotPos, 1,
 	)
@@ -1137,7 +1135,7 @@ func newPollCountingStreamer(t *testing.T) (*MockStreamerSource, *Streamer, *ato
 
 	streamer, err := NewStreamer(
 		context.Background(), state, state, state, state, batchAuthenticatorAddr, 1,
-		derivation.CreateEspressoBatchUnmarshaler(), poller, time.Millisecond, time.Millisecond, new(NoOpLogger), 0, 1,
+		poller, time.Millisecond, time.Millisecond, new(NoOpLogger), 0, 1,
 	)
 	require.NoError(t, err)
 
@@ -1178,7 +1176,6 @@ func TestStreamerPrimesFinalityBeforeStart(t *testing.T) {
 
 	streamer, err := NewStreamer(
 		context.Background(), state, state, state, state, batchAuthenticatorAddr, 1,
-		derivation.CreateEspressoBatchUnmarshaler(),
 		func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil },
 		time.Millisecond, time.Millisecond, new(NoOpLogger), 0, 1,
 	)

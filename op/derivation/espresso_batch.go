@@ -90,16 +90,13 @@ func BlockToEspressoBatch(rollupCfg *rollup.Config, block *types.Block) (*Espres
 	}, nil
 }
 
-// CreateEspressoBatchUnmarshaler returns a function that can be used to
-// unmarshal an Espresso transaction into an EspressoBatch.
-// The signer address is recovered from the signature and stored on the batch
-// for later verification in CheckBatch (two-phase verification).
-func CreateEspressoBatchUnmarshaler() func(data []byte, l1Finalized uint64) (*EspressoBatch, error) {
-	return func(data []byte, l1Finalized uint64) (*EspressoBatch, error) {
-		return UnmarshalEspressoTransaction(data, l1Finalized)
-	}
-}
-
+// UnmarshalEspressoTransaction decodes an Espresso transaction payload into an
+// EspressoBatch. The signer address is recovered from the signature and stored on the
+// batch for later verification in checkBatch (two-phase verification).
+//
+// l1Finalized is not carried in the payload: it is the finalized L1 block reported by
+// the HotShot header that ordered this transaction, attached here so checkBatch can
+// anchor the batcher lookup to it. See the field comment on EspressoBatch.L1Finalized.
 func UnmarshalEspressoTransaction(data []byte, l1Finalized uint64) (*EspressoBatch, error) {
 	if len(data) < crypto.SignatureLength {
 		return nil, fmt.Errorf("transaction data too short: %d bytes, need at least %d", len(data), crypto.SignatureLength)

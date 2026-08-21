@@ -31,7 +31,6 @@ type Streamer struct {
 	batchAuthenticatorCaller *bindings.BatchAuthenticatorCaller
 	rollupL1Client           L1Client
 	namespace                uint64
-	unmarshal                func([]byte, uint64) (*derivation.EspressoBatch, error)
 
 	store *batchStore
 
@@ -103,7 +102,6 @@ func NewStreamer(
 	lightClient LightClientCallerInterface,
 	batchAuthenticatorAddress common.Address,
 	namespace uint64,
-	unmarshal func([]byte, uint64) (*derivation.EspressoBatch, error),
 	pollerFunc func(context.Context) (*eth.SyncStatus, error),
 	retryTime time.Duration,
 	idlePollInterval time.Duration,
@@ -147,7 +145,6 @@ func NewStreamer(
 	return &Streamer{
 		espressoClient:            espressoClient,
 		namespace:                 namespace,
-		unmarshal:                 unmarshal,
 		pollerFunc:                pollerFunc,
 		logger:                    logger,
 		retryTime:                 retryTime,
@@ -229,10 +226,6 @@ func (s *Streamer) GetFallbackHotshotPos() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.fallbackHotShotPos
-}
-
-func (s *Streamer) UnmarshalBatch(b []byte, l1Finalized uint64) (*derivation.EspressoBatch, error) {
-	return s.unmarshal(b, l1Finalized)
 }
 
 // RewindTip rewinds the streamer's tip to the given point, so the next batch it serves is that
@@ -617,7 +610,7 @@ processing:
 // reaches that height, which tells the caller to stop reading here and come back. A
 // returned error is a failed L1 lookup, which is transient and worth retrying.
 func (s *Streamer) process(ctx context.Context, hotShotHeight uint64, l1Finalized uint64, txn *espressoCommon.Transaction) (awaitL1 uint64, err error) {
-	batch, err := s.unmarshal(txn.Payload, l1Finalized)
+	batch, err := derivation.UnmarshalEspressoTransaction(txn.Payload, l1Finalized)
 	if err != nil {
 		// Anyone can post to the namespace, so undecodable payloads are ordinary traffic.
 		s.logger.Warn("failed to unmarshal batch", "hotShotHeight", hotShotHeight, "err", err)
