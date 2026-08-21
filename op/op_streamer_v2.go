@@ -27,6 +27,7 @@ const defaultFinalityInterval = 10 * time.Second
 
 type Streamer struct {
 	espressoClient           EspressoClient
+	l2Client                 L2Client
 	espressoLightClient      LightClientCallerInterface
 	batchAuthenticatorCaller *bindings.BatchAuthenticatorCaller
 	rollupL1Client           L1Client
@@ -45,6 +46,11 @@ type Streamer struct {
 	logger log.Logger
 
 	finalizedL1 eth.L1BlockRef
+
+	// lastValidatedFinalizedL2 is the highest reported finalized L2 height that was
+	// verified against the local chain, so an unchanged reading is not re-verified
+	// every tick. Written only by the finality goroutine (and the priming poll).
+	lastValidatedFinalizedL2 uint64
 
 	// Cache for finalized L1 block hashes, keyed by L1 origin block number.
 	finalizedL1StateCache *lru.Cache[uint64, l1State]
@@ -128,6 +134,7 @@ func NewStreamer(
 	}
 	return &Streamer{
 		espressoClient:            espressoClient,
+		l2Client:                  l2Client,
 		namespace:                 namespace,
 		unmarshal:                 unmarshal,
 		pollerFunc:                pollerFunc,
@@ -158,9 +165,9 @@ func (s *Streamer) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
-	// Initialize finality
+	// Initialize finality. pollForFinality scopes its own per-phase timeouts.
+	s.pollForFinality(ctx)
 	primeCtx, cancelPrime := context.WithTimeout(ctx, pollRPCTimeout)
-	s.pollForFinality(primeCtx)
 	s.fastForwardToFallback(primeCtx)
 	cancelPrime()
 
@@ -264,23 +271,25 @@ func (s *Streamer) pollFinality(ctx context.Context) {
 	ticker := time.NewTicker(s.finalityInterval)
 	defer ticker.Stop()
 
-	var lastFinalizedL2 uint64
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
-
-		callCtx, cancel := context.WithTimeout(ctx, pollRPCTimeout)
-		finalizedL2 := s.pollForFinality(callCtx)
-		cancel()
-
-		if finalizedL2 > lastFinalizedL2 {
-			lastFinalizedL2 = finalizedL2
-			s.store.advanceOnFinalization(finalizedL2)
-		}
+		s.finalityTick(ctx)
 	}
+}
+
+// finalityTick refreshes the finality view and prunes the store. pollForFinality
+// validates the reading against the local chain before returning it, so a non-zero
+// height here is safe to act on; advanceOnFinalization carries its own guards.
+func (s *Streamer) finalityTick(ctx context.Context) {
+	finalizedL2 := s.pollForFinality(ctx)
+	if finalizedL2 == 0 {
+		return
+	}
+	s.store.advanceOnFinalization(finalizedL2)
 }
 
 // fastForwardToFallback jumps the HotShot cursor to the fallback position computed by
@@ -352,7 +361,11 @@ func (s *Streamer) pollHotShot(ctx context.Context) {
 // position, returning the finalized L2 height it saw so the caller can decide whether the
 // store needs pruning. It returns 0 when the sync status could not be used.
 func (s *Streamer) pollForFinality(ctx context.Context) uint64 {
-	syncStatus, err := s.pollerFunc(ctx)
+	// Each phase gets its own timeout so a slow phase cannot starve the ones after
+	// it (the L2 validation below must not inherit an exhausted budget).
+	statusCtx, cancelStatus := context.WithTimeout(ctx, pollRPCTimeout)
+	defer cancelStatus()
+	syncStatus, err := s.pollerFunc(statusCtx)
 	if err != nil {
 		s.logger.Warn("failed to fetch sync status", "err", err)
 		return 0
@@ -361,7 +374,7 @@ func (s *Streamer) pollForFinality(ctx context.Context) uint64 {
 		s.logger.Warn("sync status is nil")
 		return 0
 	}
-	finalizedL1 := s.getLatestFinalizedL1(ctx, syncStatus.FinalizedL1)
+	finalizedL1 := s.getLatestFinalizedL1(statusCtx, syncStatus.FinalizedL1)
 	if finalizedL1 == (eth.L1BlockRef{}) {
 		s.logger.Warn("finalized L1 block is empty")
 		return 0
@@ -383,7 +396,33 @@ func (s *Streamer) pollForFinality(ctx context.Context) uint64 {
 	if syncStatus.FinalizedL2 == (eth.L2BlockRef{}) {
 		return 0
 	}
-	s.confirmEspressoBlockHeight(ctx, syncStatus.FinalizedL2.L1Origin)
+
+	// Validate the reading against the local chain before pruning or the fallback
+	// consume it: the hash must match, not merely resolve.
+	// Rejecting a bad reading only makes pruning and the fallback staler, never wrong.
+	if syncStatus.FinalizedL2.Number > s.lastValidatedFinalizedL2 {
+		if syncStatus.FinalizedL2.Hash == (common.Hash{}) {
+			s.logger.Warn("finalized L2 reading carries a zero hash, ignoring",
+				"finalizedL2", syncStatus.FinalizedL2.Number)
+			return 0
+		}
+		verifyCtx, cancelVerify := context.WithTimeout(ctx, pollRPCTimeout)
+		localHash, err := s.l2Client.HeaderHashByNumber(verifyCtx, new(big.Int).SetUint64(syncStatus.FinalizedL2.Number))
+		cancelVerify()
+		if err != nil || localHash != syncStatus.FinalizedL2.Hash {
+			s.logger.Warn("finalized L2 reading does not match the local chain, ignoring",
+				"finalizedL2", syncStatus.FinalizedL2.Number,
+				"reportedHash", syncStatus.FinalizedL2.Hash,
+				"localHash", localHash,
+				"err", err)
+			return 0
+		}
+		s.lastValidatedFinalizedL2 = syncStatus.FinalizedL2.Number
+	}
+
+	confirmCtx, cancelConfirm := context.WithTimeout(ctx, pollRPCTimeout)
+	s.confirmEspressoBlockHeight(confirmCtx, syncStatus.FinalizedL2.L1Origin)
+	cancelConfirm()
 
 	return syncStatus.FinalizedL2.Number
 }

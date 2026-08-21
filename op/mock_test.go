@@ -259,6 +259,21 @@ func (m *MockStreamerSource) HeaderHashByNumber(ctx context.Context, number *big
 	return l1Ref.Hash, nil
 }
 
+// boundedL2Client wraps the mock in an L2 role whose chain ends at head: higher
+// heights resolve to the zero hash, so tests can present a finalized L2 reading that
+// names a block the chain does not have.
+type boundedL2Client struct {
+	*MockStreamerSource
+	head uint64
+}
+
+func (b *boundedL2Client) HeaderHashByNumber(ctx context.Context, number *big.Int) (common.Hash, error) {
+	if number.Uint64() > b.head {
+		return common.Hash{}, nil
+	}
+	return b.MockStreamerSource.HeaderHashByNumber(ctx, number)
+}
+
 // HeaderByNumber resolves a height, or the negative rpc tags. The finalized tag answers
 // with L1FinalizedTagHeight when a test sets it, so the chain's own finality can be
 // modelled as running ahead of what SyncStatus reports; otherwise the two agree.

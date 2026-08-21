@@ -751,6 +751,38 @@ func TestPollHotShotIdlesWhenCaughtUp(t *testing.T) {
 		"the poll loop went quiet instead of pacing: %d calls in 200ms", calls)
 }
 
+// A finalized L2 reading that does not match a block on the local L2 chain must
+// neither prune the store nor raise the watermark. A later verifiable reading must
+// still work.
+func TestFinalityTickIgnoresUnverifiableL2Height(t *testing.T) {
+	const origin = uint64(1)
+	state := NewMockStreamerSource()
+	boundedL2 := &boundedL2Client{MockStreamerSource: state, head: 50}
+	streamer, err := NewStreamer(
+		context.Background(), state, state, boundedL2, state, batchAuthenticatorAddr, 42,
+		derivation.CreateEspressoBatchUnmarshaler(),
+		func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil },
+		time.Second, time.Second, new(NoOpLogger), 0, origin,
+	)
+	require.NoError(t, err)
+	state.AdvanceFinalizedL1ByNBlocks(10)
+	acceptedBatch(t, streamer, origin+1, createHashFromHeight(origin))
+
+	state.FinalizedL2 = createL2BlockRef(1_000_000, state.FinalizedL1) // beyond the local chain
+
+	streamer.finalityTick(context.Background())
+
+	require.Equal(t, uint64(0), streamer.store.finalizedL2(),
+		"a reading naming a block the chain does not have must not raise the watermark")
+	require.Equal(t, 1, storeTotal(streamer), "the store must not be pruned on a garbage reading")
+
+	// A verifiable reading afterwards still raises the watermark.
+	state.FinalizedL2 = createL2BlockRef(origin, state.FinalizedL1)
+	streamer.finalityTick(context.Background())
+	require.Equal(t, origin, streamer.store.finalizedL2(),
+		"a verifiable reading must still be adopted")
+}
+
 // TestPollForFinalityTakesTheFurtherAheadL1View covers reading L1 finality straight from
 // the chain alongside the sync status: op-node polls the finalized tag only every
 // l1.epoch-poll-interval, so its view can trail the chain and every batch waiting on its
