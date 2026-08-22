@@ -15,7 +15,6 @@ import (
 	"github.com/ethereum-optimism/optimism/op-service/crypto"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	opsigner "github.com/ethereum-optimism/optimism/op-service/signer"
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	geth_types "github.com/ethereum/go-ethereum/core/types"
 	"github.com/stretchr/testify/require"
@@ -36,7 +35,6 @@ func newTestStreamer(t *testing.T, namespace uint64, batcher common.Address, ori
 
 	streamer, err := NewStreamer(
 		context.Background(),
-		state,
 		state,
 		state,
 		state,
@@ -91,34 +89,30 @@ func TestNewStreamerValidation(t *testing.T) {
 	state := NewMockStreamerSource()
 	poller := func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil }
 
-	newWith := func(authAddr common.Address, l2 L2Client, lc LightClientCallerInterface,
+	newWith := func(authAddr common.Address, l2 L2Client,
 		p func(context.Context) (*eth.SyncStatus, error), interval time.Duration) error {
 		_, err := NewStreamer(
-			context.Background(), state, state, l2, lc, authAddr, 1,
+			context.Background(), state, state, l2, authAddr, 1,
 			p, interval, time.Second, new(NoOpLogger), 0, 1,
 		)
 		return err
 	}
 
 	t.Run("valid", func(t *testing.T) {
-		require.NoError(t, newWith(batchAuthenticatorAddr, state, state, poller, time.Second))
+		require.NoError(t, newWith(batchAuthenticatorAddr, state, poller, time.Second))
 	})
 	t.Run("zero BatchAuthenticator address", func(t *testing.T) {
-		require.ErrorContains(t, newWith(common.Address{}, state, state, poller, time.Second), "BatchAuthenticator address must be set")
+		require.ErrorContains(t, newWith(common.Address{}, state, poller, time.Second), "BatchAuthenticator address must be set")
 	})
 	t.Run("nil pollerFunc", func(t *testing.T) {
-		require.ErrorContains(t, newWith(batchAuthenticatorAddr, state, state, nil, time.Second), "pollerFunc must be set")
+		require.ErrorContains(t, newWith(batchAuthenticatorAddr, state, nil, time.Second), "pollerFunc must be set")
 	})
 	t.Run("nil l2Client", func(t *testing.T) {
-		require.ErrorContains(t, newWith(batchAuthenticatorAddr, nil, state, poller, time.Second), "l2Client must be set")
-	})
-	t.Run("nil lightClient", func(t *testing.T) {
-		// It is read every poll iteration, so a nil would panic in the poll goroutine.
-		require.ErrorContains(t, newWith(batchAuthenticatorAddr, state, nil, poller, time.Second), "lightClient must be set")
+		require.ErrorContains(t, newWith(batchAuthenticatorAddr, nil, poller, time.Second), "l2Client must be set")
 	})
 	t.Run("non-positive retryTime", func(t *testing.T) {
 		// Otherwise a failing endpoint would be retried with no delay at all.
-		require.ErrorContains(t, newWith(batchAuthenticatorAddr, state, state, poller, 0), "retryTime must be positive")
+		require.ErrorContains(t, newWith(batchAuthenticatorAddr, state, poller, 0), "retryTime must be positive")
 	})
 }
 
@@ -941,116 +935,6 @@ func TestPollForFinalityReportsTheFinalizedL2Height(t *testing.T) {
 	require.Equal(t, uint64(5), streamer.pollForFinality(ctx))
 }
 
-// TestFastForwardToFallback covers the fallback position: the cursor jumps from the
-// origin to the fallback only when origin < fallback <= HotShot head; otherwise it
-// stays put, trading speed for safety.
-func TestFastForwardToFallback(t *testing.T) {
-	cases := []struct {
-		name     string
-		fallback uint64
-		headErr  error
-		want     uint64
-	}{
-		{"jumps to a valid fallback", 500, nil, 500},
-		{"fallback above the head: stays at origin", 5000, nil, 0},
-		{"head unavailable: stays at origin", 500, errors.New("query service down"), 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			state, streamer := newTestStreamer(t, 42, common.Address{}, 1) // cursor starts at 0
-			state.LatestEspHeight = 998                                    // the HotShot head answers 1000
-			state.FinalizedL2 = createL2BlockRef(20, 7)
-			state.FinalizedStateFunc = func(*bind.CallOpts) (FinalizedState, error) {
-				return FinalizedState{BlockHeight: tc.fallback}, nil
-			}
-
-			streamer.pollForFinality(context.Background())
-			state.LatestHeightErr = tc.headErr
-			streamer.fastForwardToFallback(context.Background())
-
-			require.Equal(t, tc.want, streamer.hotShotPos)
-		})
-	}
-}
-
-func TestFallbackHotshotPosFromLightClient(t *testing.T) {
-	ctx := context.Background()
-	const originHotShotPos = uint64(0)
-
-	state, streamer := newTestStreamer(t, 42, common.Address{}, 1)
-	require.Equal(t, originHotShotPos, streamer.GetFallbackHotshotPos(),
-		"before any poll the fallback is the streamer's HotShot origin")
-
-	// Finality at L2 block 20, whose L1 origin is block 7; the light client reports
-	// HotShot height 500 as of that L1 block.
-	state.FinalizedL2 = createL2BlockRef(20, 7)
-	var queriedAt uint64
-	state.FinalizedStateFunc = func(opts *bind.CallOpts) (FinalizedState, error) {
-		queriedAt = opts.BlockNumber.Uint64()
-		return FinalizedState{BlockHeight: 500}, nil
-	}
-
-	streamer.pollForFinality(ctx)
-
-	require.Equal(t, uint64(7), queriedAt, "the light client is queried at the finalized L2 block's L1 origin")
-	require.Equal(t, uint64(500), streamer.GetFallbackHotshotPos())
-}
-
-// TestFallbackHotshotPosStartsAtStreamerOrigin covers the pre-poll value: until the
-// light client has been read, the position to fall back to is where the streamer was
-// told to start.
-func TestFallbackHotshotPosStartsAtStreamerOrigin(t *testing.T) {
-	const originHotShotPos = uint64(100)
-
-	state := NewMockStreamerSource()
-	streamer, err := NewStreamer(
-		context.Background(), state, state, state, state, batchAuthenticatorAddr, 42,
-		func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil },
-		time.Second, time.Second, new(NoOpLogger), originHotShotPos, 1,
-	)
-	require.NoError(t, err)
-
-	require.Equal(t, originHotShotPos, streamer.GetFallbackHotshotPos())
-}
-
-func TestFallbackHotshotPosKeptWhenLightClientFails(t *testing.T) {
-	ctx := context.Background()
-	state, streamer := newTestStreamer(t, 42, common.Address{}, 1)
-
-	state.FinalizedL2 = createL2BlockRef(20, 7)
-	state.FinalizedStateFunc = func(opts *bind.CallOpts) (FinalizedState, error) {
-		return FinalizedState{BlockHeight: 500}, nil
-	}
-	streamer.pollForFinality(ctx)
-	require.Equal(t, uint64(500), streamer.GetFallbackHotshotPos())
-
-	// An unreachable light client is not fatal: the streamer keeps the position it had.
-	state.FinalizedStateFunc = func(opts *bind.CallOpts) (FinalizedState, error) {
-		return FinalizedState{}, errors.New("light client unreachable")
-	}
-	streamer.pollForFinality(ctx)
-	require.Equal(t, uint64(500), streamer.GetFallbackHotshotPos())
-}
-
-// TestFallbackHotshotPosSkippedBeforeAnyFinalizedL2 covers the pre-finality window: with
-// nothing finalized there is no L1 origin to pin a HotShot height to, so the light client
-// is left alone.
-func TestFallbackHotshotPosSkippedBeforeAnyFinalizedL2(t *testing.T) {
-	ctx := context.Background()
-	state, streamer := newTestStreamer(t, 42, common.Address{}, 1)
-
-	state.FinalizedL2 = eth.L2BlockRef{}
-	called := false
-	state.FinalizedStateFunc = func(opts *bind.CallOpts) (FinalizedState, error) {
-		called = true
-		return FinalizedState{BlockHeight: 500}, nil
-	}
-
-	streamer.pollForFinality(ctx)
-	require.False(t, called, "the light client must not be queried without a finalized L2 block")
-	require.Zero(t, streamer.GetFallbackHotshotPos())
-}
-
 // -----------------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------------
@@ -1069,7 +953,7 @@ func newPollCountingStreamer(t *testing.T) (*MockStreamerSource, *Streamer, *ato
 	}
 
 	streamer, err := NewStreamer(
-		context.Background(), state, state, state, state, batchAuthenticatorAddr, 1,
+		context.Background(), state, state, state, batchAuthenticatorAddr, 1,
 		poller, time.Millisecond, time.Millisecond, new(NoOpLogger), 0, 1,
 	)
 	require.NoError(t, err)
@@ -1110,7 +994,7 @@ func TestStreamerPrimesFinalityBeforeStart(t *testing.T) {
 	state.AdvanceFinalizedL1ByNBlocks(10)
 
 	streamer, err := NewStreamer(
-		context.Background(), state, state, state, state, batchAuthenticatorAddr, 1,
+		context.Background(), state, state, state, batchAuthenticatorAddr, 1,
 		func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil },
 		time.Millisecond, time.Millisecond, new(NoOpLogger), 0, 1,
 	)

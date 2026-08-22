@@ -22,7 +22,6 @@ import (
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/testutils"
 	"github.com/ethereum/go-ethereum"
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	geth_types "github.com/ethereum/go-ethereum/core/types"
@@ -82,8 +81,6 @@ type MockStreamerSource struct {
 	// resolves to TeeBatcherAddr (the common case). Used to simulate batcher
 	// rotations keyed by L1 block.
 	EspressoBatcherByBlock func(l1Block uint64) common.Address
-	// FinalizedStateFunc, when set, replaces the light client's FinalizedState reply.
-	FinalizedStateFunc func(opts *bind.CallOpts) (FinalizedState, error)
 
 	// LatestHeightCalls counts FetchLatestBlockHeight calls, which is once per HotShot
 	// loop iteration. Atomic because that loop runs on its own goroutine.
@@ -434,26 +431,6 @@ func (m *MockStreamerSource) StreamTransactionsInNamespace(ctx context.Context, 
 		end:       m.LatestEspHeight,
 		namespace: namespace,
 		source:    m,
-	}, nil
-}
-
-// Espresso Light Client implementation
-var _ LightClientCallerInterface = (*MockStreamerSource)(nil)
-
-// LightClientCallerInterface implementation
-func (m *MockStreamerSource) FinalizedState(opts *bind.CallOpts) (FinalizedState, error) {
-	// Let a test drive the light client directly, to model a height per L1 block or an
-	// unreachable contract.
-	if m.FinalizedStateFunc != nil {
-		return m.FinalizedStateFunc(opts)
-	}
-	height, ok := m.finalizedHeightHistory[opts.BlockNumber.Uint64()]
-	if !ok {
-		height = m.LatestEspHeight
-	}
-	return FinalizedState{
-		ViewNum:     height,
-		BlockHeight: height,
 	}, nil
 }
 

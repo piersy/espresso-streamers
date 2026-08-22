@@ -45,24 +45,6 @@ const DroppingBatchLogPrefix = "Dropping batch"
 // a single batched attempt.
 const HOTSHOT_BLOCK_FETCH_LIMIT = 100
 
-// Espresso light client bindings don't have an explicit name for this struct,
-// so we define it here to avoid spelling it out every time
-type FinalizedState = struct {
-	ViewNum       uint64
-	BlockHeight   uint64
-	BlockCommRoot *big.Int
-}
-
-// LightClientCallerInterface is an interface that documents the methods we utilize
-// for the espresso light client
-//
-// We define this here locally in order to effectively document the methods
-// we utilize.  This approach allows us to avoid importing the entire package
-// and allows us to easily swap implementations for testing.
-type LightClientCallerInterface interface {
-	FinalizedState(opts *bind.CallOpts) (FinalizedState, error)
-}
-
 // EspressoClient is an interface that documents the methods we utilize for
 // the espressoClient.Client.
 //

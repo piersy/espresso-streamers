@@ -27,7 +27,6 @@ const defaultFinalityInterval = 10 * time.Second
 
 type Streamer struct {
 	espressoClient           EspressoClient
-	espressoLightClient      LightClientCallerInterface
 	batchAuthenticatorCaller *bindings.BatchAuthenticatorCaller
 	rollupL1Client           L1Client
 	namespace                uint64
@@ -43,10 +42,6 @@ type Streamer struct {
 	// otherwise. It saves re-reading a range only to defer it again. Owned by the
 	// HotShot loop, like hotShotPos.
 	pendingL1 uint64
-
-	// HotShot height guaranteed not to contain batches this streamer has yet to see,
-	// read from the light client at the finalized L2 block's L1 origin.
-	fallbackHotShotPos uint64
 
 	logger log.Logger
 
@@ -99,7 +94,6 @@ func NewStreamer(
 	espressoClient EspressoClient,
 	rollupL1Client L1Client,
 	l2Client L2Client,
-	lightClient LightClientCallerInterface,
 	batchAuthenticatorAddress common.Address,
 	namespace uint64,
 	pollerFunc func(context.Context) (*eth.SyncStatus, error),
@@ -117,9 +111,6 @@ func NewStreamer(
 	}
 	if l2Client == nil {
 		return nil, fmt.Errorf("l2Client must be set: the origin batch hash is resolved from it")
-	}
-	if lightClient == nil {
-		return nil, fmt.Errorf("lightClient must be set: the fallback HotShot position is read from it")
 	}
 	if retryTime <= 0 {
 		return nil, fmt.Errorf("retryTime must be positive, got %s", retryTime)
@@ -152,11 +143,9 @@ func NewStreamer(
 		finalityInterval:          defaultFinalityInterval,
 		store:                     newBatchStore(eth.BlockID{Hash: originBatchHash, Number: originBatchPos}, logger),
 		hotShotPos:                originHotShotPos,
-		fallbackHotShotPos:        originHotShotPos,
 		finalizedL1StateCache:     finalizedL1StateCache,
 		batcherAtL1FinalizedCache: batcherAtL1FinalizedCache,
 		rollupL1Client:            rollupL1Client,
-		espressoLightClient:       lightClient,
 		batchAuthenticatorCaller:  batchAuthenticatorCaller,
 	}, nil
 }
@@ -176,7 +165,6 @@ func (s *Streamer) Start(ctx context.Context) error {
 	// Initialize finality
 	primeCtx, cancelPrime := context.WithTimeout(ctx, pollRPCTimeout)
 	s.pollForFinality(primeCtx)
-	s.fastForwardToFallback(primeCtx)
 	cancelPrime()
 
 	s.logger.Info("espresso streamer started",
@@ -220,14 +208,6 @@ func (s *Streamer) Next() (*derivation.EspressoBatch, error) {
 	return s.store.next()
 }
 
-// GetFallbackHotshotPos is a helper function that allows us
-// to retrieve the fallback hotshot position.
-func (s *Streamer) GetFallbackHotshotPos() uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.fallbackHotShotPos
-}
-
 // RewindTip rewinds the streamer's tip to the given point, so the next batch it serves is that
 // block's child. This allows re-reading batches from the tip onwards, which is required in the
 // case of a batcher channel reset. It fails if the given point is ahead of the current tip, since
@@ -244,7 +224,7 @@ func (s *Streamer) RewindTip(tip eth.BlockID) error {
 
 // pollFinality keeps the streamer's view of finality current, on an interval. It is
 // deliberately not hot: finality only advances at L1 block time, and each pass costs a
-// sync-status call plus a light client read. Running it apart from the HotShot loop
+// sync-status call plus an L1 header read. Running it apart from the HotShot loop
 // also keeps a slow fetch from delaying finality, and vice versa.
 func (s *Streamer) pollFinality(ctx context.Context) {
 	defer s.logger.Info("finality poll loop returning")
@@ -269,31 +249,6 @@ func (s *Streamer) pollFinality(ctx context.Context) {
 			s.store.advanceOnFinalization(finalizedL2)
 		}
 	}
-}
-
-// fastForwardToFallback jumps the HotShot cursor to the fallback position computed by
-// the priming finality poll, so a restart resumes near the finalized head instead of
-// rescanning from the configured origin. Startup-only, and only when the fallback
-// does not exceed the HotShot head.
-func (s *Streamer) fastForwardToFallback(ctx context.Context) {
-	fallback := s.GetFallbackHotshotPos()
-	if fallback <= s.hotShotPos {
-		return
-	}
-	head, err := s.espressoClient.FetchLatestBlockHeight(ctx)
-	if err != nil {
-		s.logger.Warn("cannot validate the fallback position against the HotShot head, starting from the origin",
-			"fallbackHotShotPos", fallback, "hotShotPos", s.hotShotPos, "err", err)
-		return
-	}
-	if fallback > head {
-		s.logger.Warn("fallback position is above the HotShot head, starting from the origin",
-			"fallbackHotShotPos", fallback, "hotShotHead", head)
-		return
-	}
-	s.logger.Info("fast-forwarding the HotShot cursor to the fallback position",
-		"from", s.hotShotPos, "to", fallback)
-	s.hotShotPos = fallback
 }
 
 // pollHotShot runs hot while there is a backlog: it keeps pulling from HotShot as fast
@@ -338,9 +293,9 @@ func (s *Streamer) pollHotShot(ctx context.Context) {
 	}
 }
 
-// pollForFinality refreshes the streamer's view of L1 finality and the fallback HotShot
-// position, returning the finalized L2 height it saw so the caller can decide whether the
-// store needs pruning. It returns 0 when the sync status could not be used.
+// pollForFinality refreshes the streamer's view of L1 finality, returning the finalized
+// L2 height it saw so the caller can decide whether the store needs pruning. It returns
+// 0 when no usable reading was available.
 func (s *Streamer) pollForFinality(ctx context.Context) uint64 {
 	syncStatus, err := s.pollerFunc(ctx)
 	if err != nil {
@@ -380,43 +335,8 @@ func (s *Streamer) pollForFinality(ctx context.Context) uint64 {
 	if syncStatus.FinalizedL2 == (eth.L2BlockRef{}) {
 		return 0
 	}
-	s.confirmEspressoBlockHeight(ctx, syncStatus.FinalizedL2.L1Origin)
 
 	return syncStatus.FinalizedL2.Number
-}
-
-// confirmEspressoBlockHeight pins the HotShot height that is guaranteed not to hold
-// any batch with an L1 origin at or beyond finalizedL1Origin, by reading the light
-// client's finalized state as of that L1 block. Resuming from that height cannot skip
-// an unsafe batch, which is what makes it the fallback position.
-//
-// See https://eng-wiki.espressosys.com/mainch30.html#:Components:espresso%20streamer:initializing%20hotshot%20height
-//
-// A failure is not fatal: the streamer keeps running against the position it already
-// had, so an unreachable light client only makes the fallback staler.
-func (s *Streamer) confirmEspressoBlockHeight(ctx context.Context, finalizedL1Origin eth.BlockID) {
-	hotshotState, err := s.espressoLightClient.FinalizedState(&bind.CallOpts{
-		Context:     ctx,
-		BlockNumber: new(big.Int).SetUint64(finalizedL1Origin.Number),
-	})
-	if err != nil {
-		s.logger.Warn("failed to get finalized state from light client",
-			"l1Origin", finalizedL1Origin.Number, "err", err)
-		return
-	}
-
-	s.mu.Lock()
-	previous := s.fallbackHotShotPos
-	s.fallbackHotShotPos = hotshotState.BlockHeight
-	s.mu.Unlock()
-
-	// The light client reporting a lower height than before means the L1 view it was
-	// read against changed under us. The lower height is still safe to resume from, so
-	// take it, but it is worth knowing about.
-	if hotshotState.BlockHeight < previous {
-		s.logger.Warn("light client reported a lower HotShot height than the current fallback position",
-			"l1Origin", finalizedL1Origin.Number, "previous", previous, "reported", hotshotState.BlockHeight)
-	}
 }
 
 // fetchEspressoTransactions pulls the next range of HotShot blocks and feeds the store.
