@@ -310,26 +310,6 @@ func TestCheckBatchDropsStrangerBeforeConsideringItsOrigin(t *testing.T) {
 	require.Equal(t, BatchDrop, got)
 }
 
-// TestCheckBatchPastAtOrBelowFinalizedL2 covers batches that finalization has already
-// passed: they have been derived, so they are skipped rather than stored, and without
-// spending the batcher and L1 origin lookups to find that out.
-func TestCheckBatchPastAtOrBelowFinalizedL2(t *testing.T) {
-	batcher := common.HexToAddress("0x1111111111111111111111111111111111111111")
-	const finalizedL2 = uint64(10)
-
-	for _, l2Number := range []uint64{finalizedL2 - 1, finalizedL2} {
-		_, streamer := newTestStreamer(t, 42, batcher, 1)
-		streamer.store.advanceOnFinalization(finalizedL2)
-
-		batch := chainedBatch(l2Number, common.Hash{}, batcher, 50)
-		batch.L1Finalized = 80
-		got, err := streamer.checkBatch(context.Background(), batch)
-		require.NoError(t, err)
-		require.Equal(t, BatchPast, got,
-			"batch %d is at or below the finalized L2 head %d", l2Number, finalizedL2)
-	}
-}
-
 // -----------------------------------------------------------------------------
 // Store: tip tracking, one batch per height, pruning
 // -----------------------------------------------------------------------------
@@ -485,19 +465,6 @@ func TestStoreOutOfOrderInsertsServedInOrder(t *testing.T) {
 	require.Equal(t, second.Hash(), mustNext(t, streamer).Hash())
 }
 
-// TestStoreInsertIgnoresFinalizedHeight covers the guard that makes a pruned batch
-// unrecoverable: once finality has passed a height, a batch for it is not taken back in.
-func TestStoreInsertIgnoresFinalizedHeight(t *testing.T) {
-	const origin = uint64(1)
-	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
-
-	streamer.store.advanceOnFinalization(origin + 5)
-	streamer.store.insert(chainedBatch(origin+1, createHashFromHeight(origin), common.Address{}, 1))
-
-	require.Zero(t, storeTotal(streamer),
-		"a batch at or below the finalized height must not be stored")
-}
-
 // TestStorePruneIgnoresNonAdvancingFinality covers the monotonicity guard: finality only
 // moves forward, so a repeated or regressed height must not lower what the store holds.
 func TestStorePruneIgnoresNonAdvancingFinality(t *testing.T) {
@@ -505,13 +472,13 @@ func TestStorePruneIgnoresNonAdvancingFinality(t *testing.T) {
 	_, streamer := newTestStreamer(t, 42, common.Address{}, origin)
 
 	streamer.store.advanceOnFinalization(10)
-	require.Equal(t, uint64(10), streamer.store.finalizedL2())
+	require.Equal(t, uint64(10), streamer.store.lastFinalizedL2)
 
 	streamer.store.advanceOnFinalization(4)
-	require.Equal(t, uint64(10), streamer.store.finalizedL2(), "finality must not regress")
+	require.Equal(t, uint64(10), streamer.store.lastFinalizedL2, "finality must not regress")
 
 	streamer.store.advanceOnFinalization(10)
-	require.Equal(t, uint64(10), streamer.store.finalizedL2(), "nor be lowered by a repeat")
+	require.Equal(t, uint64(10), streamer.store.lastFinalizedL2, "nor be lowered by a repeat")
 }
 
 // TestRewindTipOnlyMovesBackwards pins the direction rule: the tip otherwise advances

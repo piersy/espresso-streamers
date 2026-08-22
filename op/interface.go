@@ -19,9 +19,6 @@ const (
 	BatchDrop BatchValidity = iota
 	// BatchAccept indicates that the batch is valid and should be processed
 	BatchAccept
-	// BatchPast indicates that the batch is at or below the finalized L2 head, so it has
-	// already been derived and there is nothing left to do with it.
-	BatchPast
 )
 
 func (v BatchValidity) String() string {
@@ -30,8 +27,6 @@ func (v BatchValidity) String() string {
 		return "drop"
 	case BatchAccept:
 		return "accept"
-	case BatchPast:
-		return "past"
 	default:
 		return fmt.Sprintf("unknown(%d)", uint8(v))
 	}

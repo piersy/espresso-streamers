@@ -605,8 +605,6 @@ func (s *Streamer) process(ctx context.Context, hotShotHeight uint64, l1Finalize
 	switch validity {
 	case BatchAccept:
 		s.store.insert(batch)
-	case BatchPast:
-		s.logger.Info("Batch already processed. Skipping", "batch", batch.Number(), "hash", batch.BatchHeader.Hash())
 	case BatchDrop:
 	}
 	return 0, nil
@@ -628,12 +626,6 @@ func (s *Streamer) process(ctx context.Context, hotShotHeight uint64, l1Finalize
 // Since espresso can confirm batches out of order, the parent hash linkage cannot be
 // checked here, instead it is checked when each batch is consumed.
 func (s *Streamer) checkBatch(ctx context.Context, batch *derivation.EspressoBatch) (BatchValidity, error) {
-	// A batch at or below the finalized L2 head has already been derived, so there is
-	// nothing to do with it.
-	if batch.Number() <= s.store.finalizedL2() {
-		return BatchPast, nil
-	}
-
 	l1Finalized := batch.L1Finalized
 
 	// Look up the batcher authorized at l1Finalized which is read from Espresso Header

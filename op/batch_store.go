@@ -82,12 +82,6 @@ func (s *batchStore) insert(batch *derivation.EspressoBatch) {
 	// under it would stall the derivation caller.
 	s.mu.Lock()
 
-	// Already finalized, no need to insert
-	if num <= s.lastFinalizedL2 {
-		s.mu.Unlock()
-		return
-	}
-
 	if held, taken := s.batches[num]; taken {
 		s.mu.Unlock()
 		// Hashing outside the lock: it is not free, and nothing here needs the lock.
@@ -143,14 +137,6 @@ func (s *batchStore) next() (*derivation.EspressoBatch, error) {
 	}
 	s.tip = eth.BlockID{Hash: batch.BatchHeader.Hash(), Number: batch.Number()}
 	return batch, nil
-}
-
-// finalizedL2 returns the highest L2 block number known to be finalized. Batches at
-// or below it have already been derived.
-func (s *batchStore) finalizedL2() uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.lastFinalizedL2
 }
 
 // tipRef returns the block the next batch must extend. Its hash is the zero hash if
