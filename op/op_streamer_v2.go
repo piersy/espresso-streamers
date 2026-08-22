@@ -50,7 +50,7 @@ type Streamer struct {
 
 	logger log.Logger
 
-	finalizedL1 eth.L1BlockRef
+	finalizedL1 uint64
 
 	// Cache for finalized L1 block hashes, keyed by L1 origin block number.
 	finalizedL1StateCache *lru.Cache[uint64, l1State]
@@ -365,23 +365,15 @@ func (s *Streamer) pollForFinality(ctx context.Context) uint64 {
 		return 0
 	}
 
-	finalizedL1 := eth.L1BlockRef{
-		Number:     header.Number.Uint64(),
-		Hash:       header.Hash(),
-		ParentHash: header.ParentHash,
-		Time:       header.Time,
-	}
-
 	s.mu.Lock()
 	// L1 finality is monotonic, so a lower number means the sync source regressed
-	if finalizedL1.Number < s.finalizedL1.Number {
-		current := s.finalizedL1
+	if header.Number.Uint64() < s.finalizedL1 {
 		s.mu.Unlock()
 		s.logger.Warn("ignoring regressed finalized L1 block",
-			"current", current.Number, "reported", finalizedL1.Number)
+			"current", s.finalizedL1, "reported", header.Number.Uint64())
 		return 0
 	}
-	s.finalizedL1 = finalizedL1
+	s.finalizedL1 = header.Number.Uint64()
 	s.mu.Unlock()
 
 	// Nothing is finalized yet, so there is no L1 origin to pin a HotShot height to.
@@ -448,14 +440,14 @@ func (s *Streamer) fetchEspressoTransactions(ctx context.Context) (idle bool, er
 
 	// Nothing can be judged without a finality view, so do not read anything yet.
 	// Start primes one before the loops run, so this only holds if that failed.
-	if finalizedL1 == (eth.L1BlockRef{}) {
+	if finalizedL1 == 0 {
 		s.logger.Warn("no finalized L1 view yet, not reading from HotShot")
 		return true, nil
 	}
 
 	// A previous pass stopped waiting on finality and finality has not moved since,
 	// so re-reading the range would only reach the same point again.
-	if s.pendingL1 > finalizedL1.Number {
+	if s.pendingL1 > finalizedL1 {
 		return true, nil
 	}
 
@@ -538,12 +530,12 @@ processing:
 		// rotated-out key would slip through. This is a property of the block rather
 		// than of any batch in it, and the header is written by consensus, so no one
 		// posting to the namespace can use it to hold the reader up.
-		if blockL1Finalized > finalizedL1.Number {
+		if blockL1Finalized > finalizedL1 {
 			awaitL1 = blockL1Finalized
 			s.logger.Info("deferring HotShot block whose L1 anchor we have not finalized",
 				"hotShotHeight", hotShotHeight,
 				"headerL1Finalized", blockL1Finalized,
-				"ourL1Finalized", finalizedL1.Number)
+				"ourL1Finalized", finalizedL1)
 			break processing
 		}
 
@@ -656,7 +648,7 @@ func (s *Streamer) checkBatch(ctx context.Context, batch *derivation.EspressoBat
 	// origin. Only the authorized batcher can make us wait here.
 	origin := batch.L1Origin()
 	finalizedL1 := s.currentFinalizedL1()
-	if origin.Number > finalizedL1.Number {
+	if origin.Number > finalizedL1 {
 		return BatchDrop, errAwaitL1Finality{height: origin.Number}
 	}
 
@@ -673,7 +665,7 @@ func (s *Streamer) checkBatch(ctx context.Context, batch *derivation.EspressoBat
 }
 
 // currentFinalizedL1 returns the streamer's view of L1 finality.
-func (s *Streamer) currentFinalizedL1() eth.L1BlockRef {
+func (s *Streamer) currentFinalizedL1() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.finalizedL1

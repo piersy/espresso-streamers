@@ -65,7 +65,7 @@ type MockStreamerSource struct {
 	// of the fields provided within the SyncStatus.  At the moment it only
 	// cares about SafeL2, and FinalizedL1. So this is what we will track
 
-	FinalizedL1 eth.L1BlockRef
+	FinalizedL1 uint64
 	SafeL2      eth.L2BlockRef
 	FinalizedL2 eth.L2BlockRef
 
@@ -156,7 +156,7 @@ func (m *MockStreamerSource) FetchHeadersByRange(ctx context.Context, fromHeight
 	}
 	var headers []espressoCommon.HeaderImpl
 	for height := fromHeight; height < toHeight; height++ {
-		l1Finalized := m.FinalizedL1.Number
+		l1Finalized := m.FinalizedL1
 		if v, ok := m.l1FinalizedAtHeight[height]; ok {
 			l1Finalized = v
 		}
@@ -175,7 +175,7 @@ func (m *MockStreamerSource) FetchHeadersByRange(ctx context.Context, fromHeight
 }
 
 func NewMockStreamerSource() *MockStreamerSource {
-	finalizedL1 := createL1BlockRef(1)
+	finalizedL1 := uint64(1)
 	return &MockStreamerSource{
 		FinalizedL1:            finalizedL1,
 		SafeL2:                 createL2BlockRef(0, finalizedL1),
@@ -196,8 +196,8 @@ func (m *MockStreamerSource) AdvanceFinalizedL1ByNBlocks(n uint) {
 
 // AdvanceFinalizedL1 advances the FinalizedL1 block reference by one block.
 func (m *MockStreamerSource) AdvanceFinalizedL1() {
-	m.finalizedHeightHistory[m.FinalizedL1.Number] = m.LatestEspHeight
-	m.FinalizedL1 = createL1BlockRef(m.FinalizedL1.Number + 1)
+	m.finalizedHeightHistory[m.FinalizedL1] = m.LatestEspHeight
+	m.FinalizedL1 = m.FinalizedL1 + 1
 }
 
 // AdvanceL2ByNBlocks advances the SafeL2 block reference by n blocks.
@@ -225,7 +225,7 @@ func (m *MockStreamerSource) AdvanceEspressoHeight() {
 // are the only fields explicitly inspected by the EspressoStreamer.
 func (m *MockStreamerSource) SyncStatus() *eth.SyncStatus {
 	return &eth.SyncStatus{
-		FinalizedL1: m.FinalizedL1,
+		FinalizedL1: createL1BlockRef(m.FinalizedL1),
 		SafeL2:      m.SafeL2,
 		FinalizedL2: m.FinalizedL2,
 	}
@@ -242,7 +242,7 @@ func (m *MockStreamerSource) AddEspressoTransactionData(height, namespace uint64
 	m.EspTransactionData[BlockAndNamespace(height, namespace)] = txData
 	// The HotShot block carrying this data is produced now, so its header reports
 	// L1 finality as of now.
-	m.l1FinalizedAtHeight[height] = m.FinalizedL1.Number
+	m.l1FinalizedAtHeight[height] = m.FinalizedL1
 
 	if m.LatestEspHeight < height {
 		m.LatestEspHeight = height
@@ -269,7 +269,7 @@ func (m *MockStreamerSource) HeaderByNumber(ctx context.Context, number *big.Int
 		return nil, m.HeaderByNumberErr
 	}
 
-	height := m.FinalizedL1.Number
+	height := m.FinalizedL1
 	if number != nil && number.Sign() >= 0 {
 		height = number.Uint64()
 	} else if number != nil && number.Int64() == int64(rpc.FinalizedBlockNumber) && m.L1FinalizedTagHeight != nil {
@@ -514,7 +514,7 @@ func createL1BlockRef(height uint64) eth.L1BlockRef {
 // createL2BlockRef creates a mock L2BlockRef for testing purposes, with the
 // every field being derived from the provided height and L1BlockRef.  This
 // should be sufficient for testing purposes.
-func createL2BlockRef(height uint64, l1Ref eth.L1BlockRef) eth.L2BlockRef {
+func createL2BlockRef(height, l1Height uint64) eth.L2BlockRef {
 	return eth.L2BlockRef{
 		Number:         height,
 		Hash:           createHashFromHeight(height),
@@ -522,8 +522,8 @@ func createL2BlockRef(height uint64, l1Ref eth.L1BlockRef) eth.L2BlockRef {
 		Time:           height,
 		SequenceNumber: 1,
 		L1Origin: eth.BlockID{
-			Hash:   l1Ref.Hash,
-			Number: l1Ref.Number,
+			Hash:   createHashFromHeight(l1Height),
+			Number: l1Height,
 		},
 	}
 }
@@ -578,7 +578,7 @@ func (m *MockStreamerSource) CreateEspressoTxnData(
 	l2Height uint64,
 	chainSigner crypto.ChainSigner,
 ) (*derive.SingularBatch, *derivation.EspressoBatch, *espressoCommon.Transaction, espressoClient.TransactionsInBlock) {
-	return m.CreateEspressoTxnDataWithL1Origin(ctx, namespace, rng, chainID, l2Height, chainSigner, m.FinalizedL1.Number, m.FinalizedL1.Hash)
+	return m.CreateEspressoTxnDataWithL1Origin(ctx, namespace, rng, chainID, l2Height, chainSigner, m.FinalizedL1, createHashFromHeight(m.FinalizedL1))
 }
 
 // TestStreamerSmoke tests the basic functionality of the EspressoStreamer
