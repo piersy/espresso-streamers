@@ -25,8 +25,8 @@ import (
 const testPrivateKey = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 
 // newTestStreamer builds a Streamer over a MockStreamerSource, anchored at
-// originBatchPos. The mock resolves that position's hash to
-// createHashFromHeight(originBatchPos), which is therefore the store's initial tip.
+// originBatchPos. The anchor hash is createHashFromHeight(originBatchPos), matching
+// what the mock L1/L2 helpers use for that height, so it is the store's initial tip.
 func newTestStreamer(t *testing.T, namespace uint64, batcher common.Address, originBatchPos uint64) (*MockStreamerSource, *Streamer) {
 	t.Helper()
 
@@ -37,7 +37,6 @@ func newTestStreamer(t *testing.T, namespace uint64, batcher common.Address, ori
 		context.Background(),
 		state,
 		state,
-		state,
 		batchAuthenticatorAddr,
 		namespace,
 		func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil },
@@ -45,7 +44,7 @@ func newTestStreamer(t *testing.T, namespace uint64, batcher common.Address, ori
 		50*time.Millisecond,
 		new(NoOpLogger),
 		0,
-		originBatchPos,
+		eth.BlockID{Hash: createHashFromHeight(originBatchPos), Number: originBatchPos},
 	)
 	require.NoError(t, err)
 	return state, streamer
@@ -89,41 +88,60 @@ func TestNewStreamerValidation(t *testing.T) {
 	state := NewMockStreamerSource()
 	poller := func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil }
 
-	newWith := func(authAddr common.Address, l2 L2Client,
+	origin := eth.BlockID{Hash: createHashFromHeight(1), Number: 1}
+
+	newWith := func(authAddr common.Address, originBlock eth.BlockID,
 		p func(context.Context) (*eth.SyncStatus, error), interval time.Duration) error {
 		_, err := NewStreamer(
-			context.Background(), state, state, l2, authAddr, 1,
-			p, interval, time.Second, new(NoOpLogger), 0, 1,
+			context.Background(), state, state, authAddr, 1,
+			p, interval, time.Second, new(NoOpLogger), 0, originBlock,
 		)
 		return err
 	}
 
 	t.Run("valid", func(t *testing.T) {
-		require.NoError(t, newWith(batchAuthenticatorAddr, state, poller, time.Second))
+		require.NoError(t, newWith(batchAuthenticatorAddr, origin, poller, time.Second))
 	})
 	t.Run("zero BatchAuthenticator address", func(t *testing.T) {
-		require.ErrorContains(t, newWith(common.Address{}, state, poller, time.Second), "BatchAuthenticator address must be set")
+		require.ErrorContains(t, newWith(common.Address{}, origin, poller, time.Second), "BatchAuthenticator address must be set")
 	})
 	t.Run("nil pollerFunc", func(t *testing.T) {
-		require.ErrorContains(t, newWith(batchAuthenticatorAddr, state, nil, time.Second), "pollerFunc must be set")
+		require.ErrorContains(t, newWith(batchAuthenticatorAddr, origin, nil, time.Second), "pollerFunc must be set")
 	})
-	t.Run("nil l2Client", func(t *testing.T) {
-		require.ErrorContains(t, newWith(batchAuthenticatorAddr, nil, poller, time.Second), "l2Client must be set")
+	t.Run("origin block carrying no hash", func(t *testing.T) {
+		// Every batch is checked against the tip, so an unset one rejects all of them.
+		require.ErrorContains(t,
+			newWith(batchAuthenticatorAddr, eth.BlockID{Number: 1}, poller, time.Second),
+			"originBlock must carry the hash")
+	})
+	t.Run("wholly unset origin block", func(t *testing.T) {
+		require.ErrorContains(t,
+			newWith(batchAuthenticatorAddr, eth.BlockID{}, poller, time.Second),
+			"originBlock must carry the hash")
+	})
+	t.Run("origin block at height zero with a hash", func(t *testing.T) {
+		// Genesis is a legitimate anchor, so only the hash is required.
+		require.NoError(t,
+			newWith(batchAuthenticatorAddr, eth.BlockID{Hash: createHashFromHeight(9)}, poller, time.Second))
 	})
 	t.Run("non-positive retryTime", func(t *testing.T) {
 		// Otherwise a failing endpoint would be retried with no delay at all.
-		require.ErrorContains(t, newWith(batchAuthenticatorAddr, state, poller, 0), "retryTime must be positive")
+		require.ErrorContains(t, newWith(batchAuthenticatorAddr, origin, poller, 0), "retryTime must be positive")
 	})
 }
 
-func TestNewStreamerSeedsTipFromL2Client(t *testing.T) {
+// TestNewStreamerSeedsTipFromOriginBlock pins that the tip is exactly what the caller
+// handed over. The streamer does not resolve it from anywhere: only the caller knows
+// which block it actually processed, and re-resolving a height could pick a different
+// block after a reorg, leaving the streamer extending a chain nobody derived.
+func TestNewStreamerSeedsTipFromOriginBlock(t *testing.T) {
 	const originBatchPos = uint64(7)
 	_, streamer := newTestStreamer(t, 1, common.Address{}, originBatchPos)
 
 	require.Equal(t,
 		eth.BlockID{Hash: createHashFromHeight(originBatchPos), Number: originBatchPos},
 		streamer.store.tipRef(),
-		"tip should be the anchor block resolved from the L2 client")
+		"the tip is the origin block the caller supplied")
 }
 
 // -----------------------------------------------------------------------------
@@ -953,8 +971,9 @@ func newPollCountingStreamer(t *testing.T) (*MockStreamerSource, *Streamer, *ato
 	}
 
 	streamer, err := NewStreamer(
-		context.Background(), state, state, state, batchAuthenticatorAddr, 1,
-		poller, time.Millisecond, time.Millisecond, new(NoOpLogger), 0, 1,
+		context.Background(), state, state, batchAuthenticatorAddr, 1,
+		poller, time.Millisecond, time.Millisecond, new(NoOpLogger), 0,
+		eth.BlockID{Hash: createHashFromHeight(1), Number: 1},
 	)
 	require.NoError(t, err)
 
@@ -994,9 +1013,10 @@ func TestStreamerPrimesFinalityBeforeStart(t *testing.T) {
 	state.AdvanceFinalizedL1ByNBlocks(10)
 
 	streamer, err := NewStreamer(
-		context.Background(), state, state, state, batchAuthenticatorAddr, 1,
+		context.Background(), state, state, batchAuthenticatorAddr, 1,
 		func(context.Context) (*eth.SyncStatus, error) { return state.SyncStatus(), nil },
-		time.Millisecond, time.Millisecond, new(NoOpLogger), 0, 1,
+		time.Millisecond, time.Millisecond, new(NoOpLogger), 0,
+		eth.BlockID{Hash: createHashFromHeight(1), Number: 1},
 	)
 	require.NoError(t, err)
 	require.Zero(t, streamer.finalizedL1, "finality is unknown until a poll happens")

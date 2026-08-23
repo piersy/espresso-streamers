@@ -86,14 +86,17 @@ func (e errAwaitL1Finality) Error() string {
 	return fmt.Sprintf("awaiting L1 finality at block %d", e.height)
 }
 
-// NewStreamer builds a streamer anchored at originBatchPos, resolving that block's
-// hash from the L2 client to seed the tip it tracks. It performs that one lookup
-// before returning.
+// NewStreamer builds a streamer anchored at originBlock, which seeds the tip it tracks.
+// The first batch it serves is that block's child.
+//
+// The caller supplies the block rather than a height for the streamer to resolve. Only
+// the caller knows which block it actually processed before shutting down; looking the
+// height up on an L2 client could return a different block for the same height after a
+// reorg, and the streamer would then extend a chain nobody derived.
 func NewStreamer(
 	ctx context.Context,
 	espressoClient EspressoClient,
 	rollupL1Client L1Client,
-	l2Client L2Client,
 	batchAuthenticatorAddress common.Address,
 	namespace uint64,
 	pollerFunc func(context.Context) (*eth.SyncStatus, error),
@@ -101,7 +104,7 @@ func NewStreamer(
 	idlePollInterval time.Duration,
 	logger log.Logger,
 	originHotShotPos uint64,
-	originBatchPos uint64,
+	originBlock eth.BlockID,
 ) (*Streamer, error) {
 	if batchAuthenticatorAddress == (common.Address{}) {
 		return nil, fmt.Errorf("BatchAuthenticator address must be set for Espresso streamer")
@@ -109,22 +112,18 @@ func NewStreamer(
 	if pollerFunc == nil {
 		return nil, fmt.Errorf("pollerFunc must be set: the poll loop needs a sync status source")
 	}
-	if l2Client == nil {
-		return nil, fmt.Errorf("l2Client must be set: the origin batch hash is resolved from it")
+	// The tip is what every batch is checked against, so an unset one would reject
+	// every batch the store is handed. Height 0 is legitimate, a zero hash is not.
+	if originBlock.Hash == (common.Hash{}) {
+		return nil, fmt.Errorf(
+			"originBlock must carry the hash of the block to resume from, got the zero hash at height %d",
+			originBlock.Number)
 	}
 	if retryTime <= 0 {
 		return nil, fmt.Errorf("retryTime must be positive, got %s", retryTime)
 	}
 	if idlePollInterval <= 0 {
 		return nil, fmt.Errorf("idlePollInterval must be positive, got %s", idlePollInterval)
-	}
-
-	originBatchHash, err := l2Client.HeaderHashByNumber(ctx, new(big.Int).SetUint64(originBatchPos))
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve the L2 block hash at origin batch position %d: %w", originBatchPos, err)
-	}
-	if originBatchHash == (common.Hash{}) {
-		return nil, fmt.Errorf("L2 block hash at origin batch position %d is the zero hash", originBatchPos)
 	}
 
 	finalizedL1StateCache, _ := lru.New[uint64, l1State](1000)
@@ -141,7 +140,7 @@ func NewStreamer(
 		retryTime:                 retryTime,
 		idlePollInterval:          idlePollInterval,
 		finalityInterval:          defaultFinalityInterval,
-		store:                     newBatchStore(eth.BlockID{Hash: originBatchHash, Number: originBatchPos}, logger),
+		store:                     newBatchStore(originBlock, logger),
 		hotShotPos:                originHotShotPos,
 		finalizedL1StateCache:     finalizedL1StateCache,
 		batcherAtL1FinalizedCache: batcherAtL1FinalizedCache,

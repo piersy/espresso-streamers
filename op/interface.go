@@ -64,12 +64,6 @@ type L1Client interface {
 	bind.ContractCaller
 }
 
-// L2Client is the subset of the L2 execution client the streamer needs: resolving
-// the hash of the block it is anchored to, so the caller does not have to supply it.
-type L2Client interface {
-	HeaderHashByNumber(ctx context.Context, number *big.Int) (common.Hash, error)
-}
-
 // Subset of L1 state we're interested in for a particular L1 origin block:
 // the block hash, used to validate a batch's declared L1 origin.
 type l1State struct {
