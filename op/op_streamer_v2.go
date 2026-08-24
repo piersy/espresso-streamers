@@ -161,7 +161,8 @@ func (s *Streamer) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
-	// Initialize finality
+	// Initialize finality. pollForFinality scopes its own per-phase timeouts.
+	s.pollForFinality(ctx)
 	primeCtx, cancelPrime := context.WithTimeout(ctx, pollRPCTimeout)
 	s.pollForFinality(primeCtx)
 	cancelPrime()
@@ -231,23 +232,25 @@ func (s *Streamer) pollFinality(ctx context.Context) {
 	ticker := time.NewTicker(s.finalityInterval)
 	defer ticker.Stop()
 
-	var lastFinalizedL2 uint64
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
-
-		callCtx, cancel := context.WithTimeout(ctx, pollRPCTimeout)
-		finalizedL2 := s.pollForFinality(callCtx)
-		cancel()
-
-		if finalizedL2 > lastFinalizedL2 {
-			lastFinalizedL2 = finalizedL2
-			s.store.advanceOnFinalization(finalizedL2)
-		}
+		s.finalityTick(ctx)
 	}
+}
+
+// finalityTick refreshes the finality view and prunes the store. pollForFinality
+// validates the reading against the local chain before returning it, so a non-zero
+// height here is safe to act on; advanceOnFinalization carries its own guards.
+func (s *Streamer) finalityTick(ctx context.Context) {
+	finalizedL2 := s.pollForFinality(ctx)
+	if finalizedL2 == 0 {
+		return
+	}
+	s.store.advanceOnFinalization(finalizedL2)
 }
 
 // pollHotShot runs hot while there is a backlog: it keeps pulling from HotShot as fast
@@ -296,7 +299,11 @@ func (s *Streamer) pollHotShot(ctx context.Context) {
 // L2 height it saw so the caller can decide whether the store needs pruning. It returns
 // 0 when no usable reading was available.
 func (s *Streamer) pollForFinality(ctx context.Context) uint64 {
-	syncStatus, err := s.pollerFunc(ctx)
+	// Each phase gets its own timeout so a slow phase cannot starve the ones after
+	// it (the L2 validation below must not inherit an exhausted budget).
+	statusCtx, cancelStatus := context.WithTimeout(ctx, pollRPCTimeout)
+	defer cancelStatus()
+	syncStatus, err := s.pollerFunc(statusCtx)
 	if err != nil {
 		s.logger.Warn("failed to fetch sync status", "err", err)
 		return 0

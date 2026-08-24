@@ -32,6 +32,9 @@ type batchStore struct {
 	// at tip.Number+1, and its parent must always be tip.Hash.
 	tip eth.BlockID
 
+	// lastFinalizedL2 is the store's prune-and-reject watermark. It tracks the
+	// finalized L2 height but never passes the cursor so it may lag actual
+	// finality; lagging only keeps batches longer, it gates nothing.
 	lastFinalizedL2 uint64
 	log             log.Logger
 }
