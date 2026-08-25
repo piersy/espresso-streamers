@@ -32,11 +32,9 @@ type batchStore struct {
 	// at tip.Number+1, and its parent must always be tip.Hash.
 	tip eth.BlockID
 
-	// lastFinalizedL2 is the store's prune-and-reject watermark. It tracks the
-	// finalized L2 height but never passes the cursor so it may lag actual
-	// finality; lagging only keeps batches longer, it gates nothing.
-	lastFinalizedL2 uint64
-	log             log.Logger
+	// lastPrunePoint is the store's prune-and-reject watermark.
+	lastPrunePoint uint64
+	log            log.Logger
 }
 
 func newBatchStore(tip eth.BlockID, logger log.Logger) *batchStore {
@@ -173,17 +171,16 @@ func (s *batchStore) rewindTip(tip eth.BlockID) error {
 func (s *batchStore) advanceOnFinalization(finalizedL2 uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if finalizedL2 <= s.lastFinalizedL2 {
-		return
-	}
-	s.lastFinalizedL2 = finalizedL2
-
 	// We want to avoid deleting entries past the tip, because they have not yet been read by the
 	// consumer. hotShotPos never rewinds, so a deleted batch can never be read again.
-	end := min(s.tip.Number, finalizedL2)
+	prunePoint := min(s.tip.Number, finalizedL2)
+	if prunePoint <= s.lastPrunePoint {
+		return
+	}
+	s.lastPrunePoint = prunePoint
+
 	for height := range s.batches {
-		if height <= end {
+		if height <= prunePoint {
 			delete(s.batches, height)
 		}
 	}
@@ -191,7 +188,7 @@ func (s *batchStore) advanceOnFinalization(finalizedL2 uint64) {
 	s.log.Info(
 		"pruned finalized slots",
 		"finalizedL2", finalizedL2,
-		"prunedTo", end,
+		"prunedTo", prunePoint,
 		"remaining batches", len(s.batches),
 	)
 }

@@ -2,7 +2,6 @@ package op
 
 import (
 	"context"
-	"fmt"
 	"math/big"
 
 	espressoCommon "github.com/EspressoSystems/espresso-network/sdks/go/types"
@@ -10,27 +9,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
-
-// BatchValidity is the verdict checkBatch reaches about a batch.
-type BatchValidity uint8
-
-const (
-	// BatchDrop indicates that the batch is invalid and will stay invalid, absent a reorg
-	BatchDrop BatchValidity = iota
-	// BatchAccept indicates that the batch is valid and should be processed
-	BatchAccept
-)
-
-func (v BatchValidity) String() string {
-	switch v {
-	case BatchDrop:
-		return "drop"
-	case BatchAccept:
-		return "accept"
-	default:
-		return fmt.Sprintf("unknown(%d)", uint8(v))
-	}
-}
 
 // DroppingBatchLogPrefix is the log message prefix used when dropping a batch.
 //
