@@ -10,28 +10,47 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 )
 
-// batchStore holds the batches the streamer has validated but not yet handed to its
-// consumer, keyed by L2 block number.
+// batchStore holds the batches the streamer has validated but not yet handed to its consumer, keyed
+// by L2 block number. It also maintains a tip object which represents the read point of the
+// consumer.
 //
-// One batch per height is enough because only fully validated batches get in: the
-// fetch loop defers a HotShot block it cannot decide rather than parking an undecided
-// batch here. Anyone can post to the namespace, but a forged batch is dropped on the
-// signer check before it reaches the store, so a second batch arriving for a height
-// that is already taken means the authorized batcher produced two blocks at one
-// height. The first one HotShot ordered wins - deterministic across streamers, since
-// blocks are processed in HotShot order - and the later one is logged and ignored.
+// One batch per height is enough because batches are only inserted when they are found to:
+//
+//   - Have an L1 origin below our l1 finalized view, meaning the batch cannot be be invlaidated by an
+//     L1 re-org.
+//   - Be signed by a valid batcher fetched from an L1 view below our l1 finalized view, meaning the
+//     batcher for this block cannot change due to an L1 re-org.
+//
+// The first batch matching these criteria for a height is final, any further batches for that
+// height are discarded.
+//
+// One thing that cannot be checked at insertion time is the parent hash chain since batches can
+// arrive out of order from hotshot. So the parent hash chain is checked when a batch is consumed
+// which is safe since batches are consumed linearly in order. This check is required since it
+// ensures that the streamer cannot serve equivocating batches.
+//
+// Although these conditions prevent batches from being invalidated by L1 re-orgs, they do not
+// protect agaist the ocurrence of L2 re-orgs. In the case of an L2 re-org the batch store will
+// permanently stop serving batches. There is no in code recovery for this since it is assumed that
+// this should never happen. In this case a manual proceedure will be required to reset all streamer
+// instances.
+//
+// In normal operation batches are consumed contiguously in order, no batch may be skipped. To
+// support op batcher channel reset operations a rewind method is provided, this simply moves the
+// tip (read point) backwards so that batches already served may be served again.
+//
+// To prevent unbounded growth a prune mechanism exists. If it weren't for the existence of the
+// rewind mechanism pruning could simply prune up to the tip, but because batcher instances may need
+// to rewind, we actually only prune up to the lower of the last finalized block or the tip.ß
 type batchStore struct {
 	// batches maps L2 block number to the batch for that height.
 	batches map[uint64]*derivation.EspressoBatch
+	mu      sync.RWMutex
 
-	mu sync.RWMutex
-
-	// tip is the L2 block the next batch must extend: the last one handed to the
-	// consumer, or the block the store was anchored to if none has been. Number and
-	// hash are held together so they cannot drift - the batch to serve next is always
-	// at tip.Number+1, and its parent must always be tip.Hash.
+	// tip is the L2 block the next batch must extend: the last one handed to the consumer, or the
+	// block the store was constructed with. The batch to serve next is always at tip.Number+1, and
+	// its parent must always be tip.Hash.
 	tip eth.BlockID
-
 	// lastPrunePoint is the store's prune-and-reject watermark.
 	lastPrunePoint uint64
 	log            log.Logger
@@ -45,46 +64,17 @@ func newBatchStore(tip eth.BlockID, logger log.Logger) *batchStore {
 	}
 }
 
-// nextPos is the height of the batch the store serves next. Callers must hold the
-// lock.
-func (s *batchStore) nextPos() uint64 {
-	return s.tip.Number + 1
-}
-
-// Returns the next batch ensuring that it's parent hash links to the stored parent block, otherwise
-// an error is returned. In the case that no next batch is present a nil batch is returned.
-//
-// It is required that the mutex be held before calling this function.
-func (s *batchStore) nextBatch() (*derivation.EspressoBatch, error) {
-	n := s.batches[s.nextPos()]
-	if n == nil {
-		return nil, nil
-	}
-	if n.BatchHeader.ParentHash != s.tip.Hash {
-		return nil, fmt.Errorf(
-			"next batch does not extend the tip, blockNum: %d, tipHash: %v, parentHash: %v",
-			s.nextPos(),
-			s.tip.Hash,
-			n.BatchHeader.ParentHash,
-		)
-	}
-	return n, nil
-}
-
-// insert records a validated batch at its height. The first batch to claim a height
-// keeps it; see the type comment for why a later one is the batcher equivocating.
+// insert inserts a batch into the store at the batches number, if that number already had a batch
+// associated with it the insert is a no-op.
 func (s *batchStore) insert(batch *derivation.EspressoBatch) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	num := batch.Number()
 	parentHash := batch.BatchHeader.ParentHash
 	hash := batch.Hash()
 
-	// Every log below is emitted after unlocking, deliberately: this runs once per batch
-	// off the HotShot loop, and next contends for the same lock, so a log write held
-	// under it would stall the derivation caller.
-	s.mu.Lock()
-
 	if held, taken := s.batches[num]; taken {
-		s.mu.Unlock()
 		// Hashing outside the lock: it is not free, and nothing here needs the lock.
 		if heldHash := held.Hash(); heldHash != hash {
 			s.log.Warn(
@@ -106,7 +96,6 @@ func (s *batchStore) insert(batch *derivation.EspressoBatch) {
 	}
 
 	s.batches[num] = batch
-	s.mu.Unlock()
 
 	s.log.Info(
 		"stored batch",
@@ -116,36 +105,24 @@ func (s *batchStore) insert(batch *derivation.EspressoBatch) {
 	)
 }
 
-// next returns the batch at the current position and moves the tip onto it, so the
-// following call looks for its child. It returns nil when the store holds nothing
-// there, and an error when what it holds does not extend the tip.
-//
-// Handing the batch over and moving the tip are one step, so the position cannot move
-// without the consumer receiving the batch and a block cannot be skipped. A consumer
-// that could not use what it received winds the tip back with rewindTip and is served
-// the same batch again: taking a batch does not drop it from the store, and pruning
-// never deletes above the tip.
-//
-// Everything the store holds has already been validated, so there is no verdict to
-// reach here and no network call to make.
+// next returns the next batch and updates the tip pointer to point at the returned batch. If no
+// batch is present at that height, nil is returned and the tip is not modified. If the batch
+// parentHash does not link to the previous batch an error is returned, this signifies a permanent
+// failure any further calls to next will return the same error, the bacth store has encountered
+// eqivocation and manual recovery is required.
 func (s *batchStore) next() (*derivation.EspressoBatch, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	batch, err := s.nextBatch()
-	if err != nil || batch == nil {
-		return nil, err
+	nextPos := s.tip.Number + 1
+	n := s.batches[nextPos]
+	if n == nil {
+		return nil, nil
 	}
-	s.tip = eth.BlockID{Hash: batch.BatchHeader.Hash(), Number: batch.Number()}
-	return batch, nil
-}
-
-// tipRef returns the block the next batch must extend. Its hash is the zero hash if
-// the store has no anchor.
-func (s *batchStore) tipRef() eth.BlockID {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.tip
+	if n.BatchHeader.ParentHash != s.tip.Hash {
+		return nil, fmt.Errorf("next batch does not extend the tip, blockNum: %d, tipHash: %v, parentHash: %v", nextPos, s.tip.Hash, n.BatchHeader.ParentHash)
+	}
+	s.tip = eth.BlockID{Hash: n.BatchHeader.Hash(), Number: n.Number()}
+	return n, nil
 }
 
 // rewindTip moves the tip back to an earlier block, so the consumer can re-read the
@@ -168,7 +145,9 @@ func (s *batchStore) rewindTip(tip eth.BlockID) error {
 	return nil
 }
 
-func (s *batchStore) advanceOnFinalization(finalizedL2 uint64) {
+// prune prunes batches up to min(finalizedL2,tip.Number), it tracks the last prune point and exits
+// early avoiding iterating the map unless there is work to do.
+func (s *batchStore) prune(finalizedL2 uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// We want to avoid deleting entries past the tip, because they have not yet been read by the

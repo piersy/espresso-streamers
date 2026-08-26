@@ -217,7 +217,7 @@ func (s *Streamer) tryPrune(ctx context.Context) {
 		// Not a big problem, we can just continue to read batches, pruning will be delayed.
 		return
 	}
-	s.store.advanceOnFinalization(l2FinalizedViewHeight)
+	s.store.prune(l2FinalizedViewHeight)
 }
 
 // Stop cancels both loops and blocks until they have returned.
