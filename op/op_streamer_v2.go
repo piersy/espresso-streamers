@@ -143,15 +143,15 @@ func (s *Streamer) Start(ctx context.Context) error {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.do(ctx, s.index.HotshotPos)
+		s.run(ctx, s.index.HotshotPos)
 	}()
 	return nil
 }
 
-// I think we can do this:
-// Have a channel that receives finality updates from L1&L2, we set the variables at the top of the function and then receive updates via the channel.
-// Then the other ticker is 1 second.
-func (s *Streamer) do(ctx context.Context, hotshotReadPos uint64) {
+// run is the core of the streamer, it pulls batches from hotshot, validates them and adds them to
+// the store once the l1 state they depend on becomes finalized and periodically prunes the store to
+// keep memory under control while allowing progression.
+func (s *Streamer) run(ctx context.Context, hotshotReadPos uint64) {
 	ticker := time.NewTicker(s.hotshotPollInterval)
 	defer ticker.Stop()
 	var outstandingBatches []*derivation.EspressoBatch
