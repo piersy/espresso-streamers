@@ -54,12 +54,6 @@ func (b EspressoBatch) Hash() common.Hash {
 	return hash
 }
 
-// CanValidate verifies that the two L1 finalized heights required to validate a batch are both
-// less than or equal to the local finalized L1 view.
-func (b EspressoBatch) CanValidate(l1FinalizedView uint64) bool {
-	return b.L1Finalized <= l1FinalizedView && b.L1Origin().Number <= l1FinalizedView
-}
-
 func (b *EspressoBatch) ToEspressoTransaction(ctx context.Context, namespace uint64, signer opCrypto.ChainSigner) (*espressoCommon.Transaction, error) {
 	buf := new(bytes.Buffer)
 	err := rlp.Encode(buf, *b)

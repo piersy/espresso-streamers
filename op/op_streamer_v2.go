@@ -13,7 +13,6 @@ import (
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rpc"
 )
@@ -29,8 +28,8 @@ type Streamer struct {
 
 	logger log.Logger
 
-	// How often the finality loop refreshes its view of L1/L2 finality.
-	finalityPollInterval time.Duration
+	// How often to poll hotshot for new blocks
+	hotshotPollInterval time.Duration
 
 	// Start/Stop bookkeeping.
 	lifecycleMu sync.Mutex
@@ -48,6 +47,21 @@ type StreamerIndex struct {
 	HotshotPos uint64
 	L2Index    eth.BlockID
 }
+
+// BatchValidity is the verdict checkBatch reaches about a batch.
+type BatchValidity uint8
+
+const (
+	// BatchDrop indicates that the batch is invalid and should be dropped.
+	BatchDrop BatchValidity = iota
+	// BatchAccept indicates that the batch is valid and should be processed.
+	BatchAccept
+	// BatchPastFinality indicates that the batch cannot be processed yet because it is past the
+	// finality boundary.
+	BatchPastFinality
+	// BatchUndecided indicates that a problem ocurred when validating the batch, a retry is required.
+	BatchUndecided
+)
 
 // ErrAlreadyStarted is returned by Start when the poll loop is already running.
 var ErrAlreadyStarted = errors.New("streamer already started")
@@ -69,7 +83,7 @@ func NewStreamer(
 	logger log.Logger,
 	index StreamerIndex,
 	maxBatchesInMemory uint64,
-	finalityPollInterval time.Duration,
+	hotshotPollInterval time.Duration,
 ) (*Streamer, error) {
 	if batchAuthenticatorAddress == (common.Address{}) {
 		return nil, fmt.Errorf("BatchAuthenticator address must be set for Espresso streamer")
@@ -81,8 +95,8 @@ func NewStreamer(
 			"originBlock must carry the hash of the block to resume from, got the zero hash at height %d",
 			index.L2Index.Number)
 	}
-	if finalityPollInterval <= 0 {
-		return nil, fmt.Errorf("finalityPollInterval must be positive, got %s", finalityPollInterval)
+	if hotshotPollInterval <= 0 {
+		return nil, fmt.Errorf("finalityPollInterval must be positive, got %s", hotshotPollInterval)
 	}
 	batchAuthenticatorCaller, err := bindings.NewBatchAuthenticatorCaller(batchAuthenticatorAddress, rollupL1Client)
 	if err != nil {
@@ -98,7 +112,7 @@ func NewStreamer(
 		batchAuthenticatorCaller: batchAuthenticatorCaller,
 		index:                    index,
 		maxBatchesInMemory:       maxBatchesInMemory,
-		finalityPollInterval:     finalityPollInterval,
+		hotshotPollInterval:      hotshotPollInterval,
 	}, nil
 }
 
@@ -114,7 +128,7 @@ func (s *Streamer) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
-	s.logger.Info("espresso streamer started", "hotShotPos", s.index.HotshotPos, "finalityInterval", s.finalityPollInterval)
+	s.logger.Info("espresso streamer started", "hotShotPos", s.index.HotshotPos, "finalityInterval", s.hotshotPollInterval)
 
 	s.wg.Add(1)
 	go func() {
@@ -124,11 +138,18 @@ func (s *Streamer) Start(ctx context.Context) error {
 	return nil
 }
 
+// I think we can do this:
+// Have a channel that receives finality updates from L1&L2, we set the variables at the top of the function and then receive updates via the channel.
+// Then the other ticker is 1 second.
 func (s *Streamer) do(ctx context.Context, hotshotReadPos uint64) {
-	ticker := time.NewTicker(s.finalityPollInterval)
+	ticker := time.NewTicker(s.hotshotPollInterval)
 	defer ticker.Stop()
 	var outstandingBatches []*derivation.EspressoBatch
 	outstandingBatchesIndex := 0
+	l1FinalizedViewHeight, err := latestFinalized(ctx, s.rollupL1Client)
+	if err != nil {
+		s.logger.Warn("failed to read finalized L1 view, keeping the current view", "err", err)
+	}
 OuterLoop:
 	for {
 		select {
@@ -137,29 +158,33 @@ OuterLoop:
 		case <-ticker.C:
 		}
 
-		l1FinalizedView, err := latestFinalized(ctx, s.rollupL1Client)
-		if err != nil {
-			s.logger.Warn("failed to read finalized L1 view, keeping the current view", "err", err)
-			continue
-		}
-		l1FinalizedViewHeight := l1FinalizedView.Number.Uint64()
-
 		// The streamer will load no new batches once it reaches capacity.
 		for len(s.store.batches) < int(s.maxBatchesInMemory) {
 			for outstandingBatchesIndex < len(outstandingBatches) {
 				batch := outstandingBatches[outstandingBatchesIndex]
-				if !batch.CanValidate(l1FinalizedViewHeight) {
-					// We need to wait for finalization to progress.
-					continue OuterLoop
-				}
-				valid, err := s.checkBatch(ctx, batch)
+				batchValidity, err := s.checkBatch(ctx, batch, l1FinalizedViewHeight)
 				if err != nil {
 					s.logger.Warn("encountered error while checking batch, delaying batch processing", "err", err)
 					// Something went wrong, we will retry later.
 					continue OuterLoop
 				}
-				if valid {
+				switch batchValidity {
+				case BatchAccept:
 					s.store.insert(batch)
+				case BatchPastFinality:
+					l1Finalized, err := latestFinalized(ctx, s.rollupL1Client)
+					if err != nil {
+						s.logger.Warn("failed to read finalized L1 view, keeping the current view", "err", err)
+					}
+					if l1Finalized != l1FinalizedViewHeight {
+						// If the finalized view changed retry immediately
+						l1FinalizedViewHeight = l1Finalized
+						continue
+					} else {
+						// Otherwise jump to outer loop and continue again on the ticker
+						// We'll end up fetching the latest finalized again
+						continue OuterLoop
+					}
 				}
 				outstandingBatchesIndex++
 			}
@@ -186,13 +211,13 @@ OuterLoop:
 
 func (s *Streamer) tryPrune(ctx context.Context) {
 	// Check to see if we can prune older batches from the batch store
-	l2FinalizedView, err := latestFinalized(ctx, s.rollupL2Client)
+	l2FinalizedViewHeight, err := latestFinalized(ctx, s.rollupL2Client)
 	if err != nil {
 		s.logger.Warn("failed to read finalized L2 view, keeping the current view", "err", err)
 		// Not a big problem, we can just continue to read batches, pruning will be delayed.
 		return
 	}
-	s.store.advanceOnFinalization(l2FinalizedView.Number.Uint64())
+	s.store.advanceOnFinalization(l2FinalizedViewHeight)
 }
 
 // Stop cancels both loops and blocks until they have returned.
@@ -316,22 +341,25 @@ func (s *Streamer) fetchEspressoBatches(ctx context.Context, hotshotReadIndex ui
 //
 // Since espresso can confirm batches out of order, the parent hash linkage cannot be checked here,
 // instead it is checked when each batch is consumed.
-func (s *Streamer) checkBatch(ctx context.Context, batch *derivation.EspressoBatch) (valid bool, err error) {
+func (s *Streamer) checkBatch(ctx context.Context, batch *derivation.EspressoBatch, l1FinalityView uint64) (BatchValidity, error) {
 	l1Finalized := batch.L1Finalized
+	if l1Finalized > l1FinalityView {
+		return BatchPastFinality, nil
+	}
 
 	authorizedBatcher, err := s.batchAuthenticatorCaller.EspressoBatcherAtBlock(
 		&bind.CallOpts{Context: ctx},
 		l1Finalized,
 	)
 	if err != nil {
-		return false, fmt.Errorf("failed to fetch the espresso batcher at L1 block %d: %w", l1Finalized, err)
+		return BatchUndecided, fmt.Errorf("failed to fetch the espresso batcher at L1 block %d: %w", l1Finalized, err)
 	}
 
 	if authorizedBatcher == (common.Address{}) || batch.SignerAddress != authorizedBatcher {
 		s.logger.Info(DroppingBatchLogPrefix+" with invalid espresso batcher",
 			"batch", batch.Hash(), "signer", batch.SignerAddress,
 			"l1Finalized", l1Finalized, "authorizedBatcher", authorizedBatcher)
-		return false, nil
+		return BatchDrop, nil
 	}
 
 	// The origin check stays after the signer check deliberately: the origin is
@@ -339,29 +367,32 @@ func (s *Streamer) checkBatch(ctx context.Context, batch *derivation.EspressoBat
 	// would let a stranger stall the streamer indefinitely by naming a far-future
 	// origin. Only the authorized batcher can make us wait here.
 	origin := batch.L1Origin()
+	if origin.Number > l1FinalityView {
+		return BatchPastFinality, nil
+	}
 	// Validate that the batch's declared L1 origin references a real L1 block.
 	hash, err := s.rollupL1Client.HeaderHashByNumber(ctx, new(big.Int).SetUint64(origin.Number))
 	if err != nil {
-		return false, fmt.Errorf("failed to fetch L1 header: %w", err)
+		return BatchUndecided, fmt.Errorf("failed to fetch L1 header: %w", err)
 	}
 	if hash != origin.Hash {
 		s.logger.Warn(DroppingBatchLogPrefix + " with invalid L1 origin hash")
-		return false, nil
+		return BatchDrop, nil
 	}
-	return true, nil
+	return BatchAccept, nil
 }
 
 // latestFinalized fetches the latest finalized header from the given client and checks that the
 // header and header.Number are non nil.
-func latestFinalized(ctx context.Context, client L1Client) (*types.Header, error) {
+func latestFinalized(ctx context.Context, client L1Client) (uint64, error) {
 	header, err := client.HeaderByNumber(ctx, big.NewInt(int64(rpc.FinalizedBlockNumber)))
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch the finalized header: %w", err)
+		return 0, fmt.Errorf("failed to fetch the finalized header: %w", err)
 	}
 	// A client that answers the finalized tag with nothing usable is reporting a state
 	// we cannot act on, so it is an error rather than an absent change.
 	if header == nil || header.Number == nil {
-		return nil, fmt.Errorf("finalized header is empty")
+		return 0, fmt.Errorf("finalized header is empty")
 	}
-	return header, nil
+	return header.Number.Uint64(), nil
 }
