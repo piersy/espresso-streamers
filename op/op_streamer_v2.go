@@ -103,7 +103,7 @@ func NewStreamer(
 			index.L2Index.Number)
 	}
 	if hotshotPollInterval <= 0 {
-		return nil, fmt.Errorf("finalityPollInterval must be positive, got %s", hotshotPollInterval)
+		return nil, fmt.Errorf("hotshotPollInterval must be positive, got %s", hotshotPollInterval)
 	}
 	if maxBatchesInMemory < MaxBatchesInMemoryMin {
 		maxBatchesInMemory = MaxBatchesInMemoryMin
@@ -138,7 +138,7 @@ func (s *Streamer) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
-	s.logger.Info("espresso streamer started", "hotShotPos", s.index.HotshotPos, "finalityInterval", s.hotshotPollInterval)
+	s.logger.Info("espresso streamer started", "hotShotPos", s.index.HotshotPos, "hotshotPollInterval", s.hotshotPollInterval)
 
 	s.wg.Add(1)
 	go func() {
