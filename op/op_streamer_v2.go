@@ -185,16 +185,17 @@ OuterLoop:
 					l1Finalized, err := latestFinalized(ctx, s.rollupL1Client)
 					if err != nil {
 						s.logger.Warn("failed to read finalized L1 view, keeping the current view", "err", err)
+						// Wait on the main ticker and try again
+						continue OuterLoop
 					}
-					if l1Finalized != l1FinalizedViewHeight {
-						// If the finalized view changed retry immediately
-						l1FinalizedViewHeight = l1Finalized
-						continue
-					} else {
-						// Otherwise jump to outer loop and continue again on the ticker
+					if l1Finalized == l1FinalizedViewHeight {
+						// No change jump to outer loop and continue again on the ticker
 						// We'll end up fetching the latest finalized again
 						continue OuterLoop
 					}
+					// finality changed so we simply loop with the new finality value
+					l1FinalizedViewHeight = l1Finalized
+					continue
 				}
 				outstandingBatchesIndex++
 			}
