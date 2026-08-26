@@ -17,6 +17,12 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
+// rpcTimeout bounds RPC calls made by the streamer. The Espresso SDK builds its client on
+// http.DefaultClient, which has no timeout, and the namespace range endpoint waits for blocks it
+// does not have rather than returning a short result, so without this a hung call continues
+// indefinitely.
+const rpcTimeout = 10 * time.Second
+
 type Streamer struct {
 	espressoClient           EspressoClient
 	batchAuthenticatorCaller *bindings.BatchAuthenticatorCaller
@@ -157,7 +163,9 @@ func (s *Streamer) run(ctx context.Context, hotshotReadPos uint64) {
 	defer ticker.Stop()
 	var outstandingBatches []*derivation.EspressoBatch
 	outstandingBatchesIndex := 0
-	l1FinalizedViewHeight, err := latestFinalized(ctx, s.rollupL1Client)
+	initCtx, cancelInit := context.WithTimeout(ctx, rpcTimeout)
+	l1FinalizedViewHeight, err := latestFinalized(initCtx, s.rollupL1Client)
+	cancelInit()
 	if err != nil {
 		s.logger.Warn("failed to read finalized L1 view, keeping the current view", "err", err)
 	}
@@ -173,7 +181,9 @@ OuterLoop:
 		for s.store.size() < s.maxBatchesInMemory {
 			for outstandingBatchesIndex < len(outstandingBatches) {
 				batch := outstandingBatches[outstandingBatchesIndex]
-				batchValidity, err := s.checkBatch(ctx, batch, l1FinalizedViewHeight)
+				checkCtx, cancelCheck := context.WithTimeout(ctx, rpcTimeout)
+				batchValidity, err := s.checkBatch(checkCtx, batch, l1FinalizedViewHeight)
+				cancelCheck()
 				if err != nil {
 					s.logger.Warn("encountered error while checking batch, delaying batch processing", "err", err)
 					// Something went wrong, we will retry later.
@@ -183,7 +193,9 @@ OuterLoop:
 				case BatchAccept:
 					s.store.insert(batch)
 				case BatchPastFinality:
-					l1Finalized, err := latestFinalized(ctx, s.rollupL1Client)
+					refreshCtx, cancelRefresh := context.WithTimeout(ctx, rpcTimeout)
+					l1Finalized, err := latestFinalized(refreshCtx, s.rollupL1Client)
+					cancelRefresh()
 					if err != nil {
 						s.logger.Warn("failed to read finalized L1 view, keeping the current view", "err", err)
 						// Wait on the main ticker and try again
@@ -222,6 +234,9 @@ OuterLoop:
 }
 
 func (s *Streamer) tryPrune(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
 	// Check to see if we can prune older batches from the batch store
 	l2FinalizedViewHeight, err := latestFinalized(ctx, s.rollupL2Client)
 	if err != nil {
@@ -276,7 +291,9 @@ func (s *Streamer) RewindTip(tip eth.BlockID) error {
 // fetchEspressoBatches fetches a batch of batches from hotshot reading from the hotshotReadIndex,
 // it returns the number of hotshot blocks processed so that the caller can update the read index.
 func (s *Streamer) fetchEspressoBatches(ctx context.Context, hotshotReadIndex uint64) (batches []*derivation.EspressoBatch, hotshotBlocksProcessed uint64, err error) {
-	hotshotHeight, err := s.espressoClient.FetchLatestBlockHeight(ctx)
+	heightCtx, cancelHeight := context.WithTimeout(ctx, rpcTimeout)
+	hotshotHeight, err := s.espressoClient.FetchLatestBlockHeight(heightCtx)
+	cancelHeight()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -290,7 +307,9 @@ func (s *Streamer) fetchEspressoBatches(ctx context.Context, hotshotReadIndex ui
 		end = hotshotHeight
 	}
 
-	blocks, err := s.espressoClient.FetchNamespaceTransactionsInRange(ctx, hotshotReadIndex, end, s.namespace)
+	blocksCtx, cancelBlocks := context.WithTimeout(ctx, rpcTimeout)
+	blocks, err := s.espressoClient.FetchNamespaceTransactionsInRange(blocksCtx, hotshotReadIndex, end, s.namespace)
+	cancelBlocks()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -306,7 +325,9 @@ func (s *Streamer) fetchEspressoBatches(ctx context.Context, hotshotReadIndex ui
 
 	// Fetch the headers for the same range so each batch can be authorized against
 	// the finalized L1 block of the HotShot block that carried it (see checkBatch).
-	headers, err := s.espressoClient.FetchHeadersByRange(ctx, hotshotReadIndex, end)
+	headersCtx, cancelHeaders := context.WithTimeout(ctx, rpcTimeout)
+	headers, err := s.espressoClient.FetchHeadersByRange(headersCtx, hotshotReadIndex, end)
+	cancelHeaders()
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to fetch hotshot headers for range [%d, %d): %w", hotshotReadIndex, end, err)
 	}
