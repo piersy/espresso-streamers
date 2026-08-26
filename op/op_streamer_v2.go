@@ -48,6 +48,13 @@ type StreamerIndex struct {
 	L2Index    eth.BlockID
 }
 
+const (
+	// MaxBatchesInMemoryMin uses double the number of batches that would be sent during a finality
+	// interval. This should provide sufficient buffer to allow fetching hotshot batches while
+	// waiting for pruning driven by the finalized L2 blocks.
+	MaxBatchesInMemoryMin = 12 * 64 * 2
+)
+
 // BatchValidity is the verdict checkBatch reaches about a batch.
 type BatchValidity uint8
 
@@ -97,6 +104,9 @@ func NewStreamer(
 	}
 	if hotshotPollInterval <= 0 {
 		return nil, fmt.Errorf("finalityPollInterval must be positive, got %s", hotshotPollInterval)
+	}
+	if maxBatchesInMemory < MaxBatchesInMemoryMin {
+		maxBatchesInMemory = MaxBatchesInMemoryMin
 	}
 	batchAuthenticatorCaller, err := bindings.NewBatchAuthenticatorCaller(batchAuthenticatorAddress, rollupL1Client)
 	if err != nil {
