@@ -106,6 +106,7 @@ func NewStreamer(
 		return nil, fmt.Errorf("hotshotPollInterval must be positive, got %s", hotshotPollInterval)
 	}
 	if maxBatchesInMemory < MaxBatchesInMemoryMin {
+		logger.Warn("maxBatchesInMemory set to minimum value", "given value", maxBatchesInMemory, "minimum value", MaxBatchesInMemoryMin)
 		maxBatchesInMemory = MaxBatchesInMemoryMin
 	}
 	batchAuthenticatorCaller, err := bindings.NewBatchAuthenticatorCaller(batchAuthenticatorAddress, rollupL1Client)
