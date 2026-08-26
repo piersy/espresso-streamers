@@ -338,17 +338,15 @@ func (s *Streamer) fetchEspressoBatches(ctx context.Context, hotshotReadIndex ui
 	return batches, end - hotshotReadIndex, nil
 }
 
-// checkBatch decides whether a batch is valid. It returns a boolean indicating whether the batch is
-// valid, invalid batches should be dropped. If an error is returned it indicates a problem fetching
-// the data to validate a batch meaning the batch was not validated and the operation should be
-// retried at some later point.
+// checkBatch decides whether a batch is valid. It returns a variable indicating whether the batch
+// is valid, invalid or requires finality to progress in order for it to be validated. Invalid
+// batches should be dropped. If an error is returned it indicates a problem fetching the data to
+// validate a batch meaning the batch was not validated and the operation should be retried at some
+// later point.
 //
 // For a batch to be considered valid its signer must be the batcher authorized at the batch's
 // L1Finalized - the finalized L1 block reported by the HotShot header that carried it - and its
-// declared L1 origin must match a real L1 block.
-//
-// The caller should already have established that our own finalized view is greater than both
-// batch.L1Finalized and the batch's L1 origin.
+// declared L1 origin must match a real finalized L1 block.
 //
 // Since espresso can confirm batches out of order, the parent hash linkage cannot be checked here,
 // instead it is checked when each batch is consumed.
