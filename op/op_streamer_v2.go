@@ -126,8 +126,8 @@ func NewStreamer(
 	}, nil
 }
 
-// Start launches the two background loops - one tracking finality and one pulling from
-// Espresso it returns ErrAlreadyStarted if they are already running.
+// Start launches the run method on a goroutine it returns ErrAlreadyStarted if it is already
+// running.
 func (s *Streamer) Start(ctx context.Context) error {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
@@ -231,7 +231,7 @@ func (s *Streamer) tryPrune(ctx context.Context) {
 	s.store.prune(l2FinalizedViewHeight)
 }
 
-// Stop cancels both loops and blocks until they have returned.
+// Stop cancels the run goroutine and blocks until it has returned.
 func (s *Streamer) Stop() {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
@@ -250,16 +250,12 @@ func (s *Streamer) Stop() {
 // tip onto it. If no batch is present at the tip nil is returned, the caller can retry later.
 //
 // An error indicates a permanent failure, meaning that the streamer is permanently blocked and no
-// operation shoudl be retried.
+// operation should be retried.
 //
-// The tip only ever moves forward here, and only when a batch is returened, so no block can be
+// The tip only ever moves forward here when a batch is returened, so no block can be
 // skipped.
 func (s *Streamer) Next() (*derivation.EspressoBatch, error) {
-	batch, err := s.store.next()
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve next batch: %w", err)
-	}
-	return batch, nil
+	return s.store.next()
 }
 
 // RewindTip rewinds the streamer's tip to the given point, so the next batch it serves is that
@@ -276,6 +272,8 @@ func (s *Streamer) RewindTip(tip eth.BlockID) error {
 	return s.store.rewindTip(tip)
 }
 
+// fetchEspressoBatches fetches a batch of batches from hotshot reading from the hotshotReadIndex,
+// it returns the number of hotshot blocks processed so that the caller can update the read index.
 func (s *Streamer) fetchEspressoBatches(ctx context.Context, hotshotReadIndex uint64) (batches []*derivation.EspressoBatch, hotshotBlocksProcessed uint64, err error) {
 	hotshotHeight, err := s.espressoClient.FetchLatestBlockHeight(ctx)
 	if err != nil {
@@ -391,7 +389,7 @@ func (s *Streamer) checkBatch(ctx context.Context, batch *derivation.EspressoBat
 	return BatchAccept, nil
 }
 
-// latestFinalized fetches the latest finalized header from the given client and checks that the
+// latestFinalized fetches the latest finalized header number from the given client and checks that the
 // header and header.Number are non nil.
 func latestFinalized(ctx context.Context, client L1Client) (uint64, error) {
 	header, err := client.HeaderByNumber(ctx, big.NewInt(int64(rpc.FinalizedBlockNumber)))
