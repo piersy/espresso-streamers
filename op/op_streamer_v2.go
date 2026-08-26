@@ -40,7 +40,7 @@ type Streamer struct {
 
 	// Used to limit the amount of memory consumed by the streamer, prevents unbounded batch
 	// fetching when batches are not being consumed.
-	maxBatchesInMemory uint64
+	maxBatchesInMemory int
 }
 
 type StreamerIndex struct {
@@ -89,7 +89,7 @@ func NewStreamer(
 	namespace uint64,
 	logger log.Logger,
 	index StreamerIndex,
-	maxBatchesInMemory uint64,
+	maxBatchesInMemory int,
 	hotshotPollInterval time.Duration,
 ) (*Streamer, error) {
 	if batchAuthenticatorAddress == (common.Address{}) {
@@ -169,7 +169,7 @@ OuterLoop:
 		}
 
 		// The streamer will load no new batches once it reaches capacity.
-		for len(s.store.batches) < int(s.maxBatchesInMemory) {
+		for s.store.size() < s.maxBatchesInMemory {
 			for outstandingBatchesIndex < len(outstandingBatches) {
 				batch := outstandingBatches[outstandingBatchesIndex]
 				batchValidity, err := s.checkBatch(ctx, batch, l1FinalizedViewHeight)

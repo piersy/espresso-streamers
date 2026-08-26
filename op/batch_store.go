@@ -171,3 +171,9 @@ func (s *batchStore) prune(finalizedL2 uint64) {
 		"remaining batches", len(s.batches),
 	)
 }
+
+func (s *batchStore) size() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.batches)
+}
