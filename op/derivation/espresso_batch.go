@@ -133,7 +133,7 @@ func UnmarshalEspressoTransaction(data []byte, espressoHeader espressoCommon.Hea
 	if batch.L1InfoDeposit == nil {
 		return nil, fmt.Errorf("batch is missing the L1 info deposit transaction")
 	}
-	// This value is used as a deterministics hared finality pointer against which to validate
+	// This value is used as a deterministic shared finality pointer against which to validate
 	// the batcher that submitted a batch. Previously we used the L1 origin of the batch but
 	// actually that was not safe because an attacker can choose it. We can't use our local view
 	// of finality because that can differ between instances allowing for them to diverge. The
